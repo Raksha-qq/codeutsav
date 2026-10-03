@@ -173,6 +173,10 @@ class BilletVisionPipeline:
             self._writer.stop(timeout=15.0)
         logger.info("BilletVision pipeline stopped")
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
 

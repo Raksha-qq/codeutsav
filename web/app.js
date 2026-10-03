@@ -29,6 +29,7 @@
 
   /* ── state ──────────────────────────────────────────────────────────── */
   let _lastRecord = null;         // most-recent inspection result
+  let _lastSeenSeq = -1;          // sequence deduplication guard
   let _logRows = [];              // current visible log rows (filtered)
   let _allRows = [];              // full fetched list (pre-filter)
   let _tolerances = {};           // {profile: {key:val}}
@@ -110,10 +111,13 @@
 
   /* ── Inspection result ───────────────────────────────────────────────── */
   function _onInspection(msg) {
+    if (msg.billet_seq && msg.billet_seq === _lastSeenSeq) return;
+    if (msg.billet_seq) _lastSeenSeq = msg.billet_seq;
+
     _lastRecord = msg;
     _updateStatusTile(msg);
     _updateMeasDetails(msg);
-    _prependLogRow(msg);
+    _prependLogRow(msg, true);
 
     if (msg.status === "FAIL") { _alarmBeep(); _showAlertBanner(msg); }
     else if (msg.status === "REWORK") { _alarmBeep(); _showAlertBanner(msg); }
@@ -212,10 +216,14 @@
   /* ── Log table ──────────────────────────────────────────────────────── */
   const LOG_MAX = 100;
 
-  function _prependLogRow(msg) {
+  function _prependLogRow(msg, isNew = false) {
+    if (isNew) msg._isNew = true;
     _allRows.unshift(msg);
     if (_allRows.length > LOG_MAX) _allRows.pop();
     _renderLogTable();
+    if (isNew) {
+      setTimeout(() => { msg._isNew = false; }, 2000);
+    }
   }
 
   function _renderLogTable() {
@@ -237,7 +245,7 @@
     }
 
     tbody.innerHTML = _logRows.map(r => `
-      <tr>
+      <tr class="${r._isNew ? 'new-row' : ''}">
         <td class="mono" style="white-space:nowrap">${_esc(_fmtTime(r.timestamp))}</td>
         <td class="mono">${r.billet_seq ?? "—"}</td>
         <td class="mono"><strong>${_esc(r.billet_id || "UNKNOWN")}</strong></td>
@@ -287,6 +295,11 @@
       const rows = await res.json();
       _allRows = rows;
       _renderLogTable();
+      if (!_lastRecord && rows.length > 0) {
+        _lastRecord = rows[0];
+        _updateStatusTile(rows[0]);
+        _updateMeasDetails(rows[0]);
+      }
     } catch (_) {}
   }
 
@@ -500,7 +513,7 @@
     } catch (_) {}
   }
 
-  /* ── Drill-down modal ────────────────────────────────────────────────── */
+  /* ── Drill-down modal ─────────────────────────────────────────────────── */
   function _openModal(record) {
     const backdrop = document.getElementById("modal-backdrop");
     const title    = document.getElementById("modal-title");

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -68,6 +68,11 @@ def get_index():
     return HTMLResponse("<h1>BilletVision — pipeline running</h1>")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
 # ---------------------------------------------------------------------------
 # MJPEG video stream
 # ---------------------------------------------------------------------------
@@ -114,12 +119,18 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Stats
+# Stats / KPI
 # ---------------------------------------------------------------------------
 
 @app.get("/api/stats")
 def get_stats():
     """Live pipeline performance counters."""
+    return pipeline.stats.snapshot()
+
+
+@app.get("/api/kpi")
+def get_kpi():
+    """Alias for /api/stats for compatibility."""
     return pipeline.stats.snapshot()
 
 
@@ -139,6 +150,15 @@ def get_log(
         return fetch_recent(db_path, n=n, status=status)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/logs")
+def get_logs(
+    n: int = Query(default=50, ge=1, le=1000),
+    status: Optional[str] = Query(default=None, pattern="^(PASS|FAIL|REWORK|REVIEW)$"),
+):
+    """Alias for /api/log for backwards compatibility."""
+    return get_log(n=n, status=status)
 
 
 @app.get("/api/log/count")
@@ -180,6 +200,17 @@ def export_xlsx():
     )
 
 
+@app.get("/api/export/{file_format}")
+def export_log(file_format: str):
+    """Download log in requested format (csv or xlsx)."""
+    fmt = file_format.lower()
+    if fmt == "csv":
+        return export_csv()
+    elif fmt == "xlsx":
+        return export_xlsx()
+    raise HTTPException(status_code=404, detail=f"Unsupported format '{file_format}'. Use 'csv' or 'xlsx'.")
+
+
 # ---------------------------------------------------------------------------
 # Tolerances / profiles
 # ---------------------------------------------------------------------------
@@ -218,6 +249,18 @@ def update_tolerances(profile: str, body: ToleranceUpdate):
     try:
         updated = pipeline.update_profile_tolerances(profile, body.updates)
         return updated
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile}' not found")
+
+
+@app.post("/api/tolerances")
+def update_tolerances_post(data: Dict[str, Any]):
+    """Alternative POST endpoint for tolerance update."""
+    profile = data.get("profile_id", "square_130")
+    updates = data.get("tolerances", {})
+    try:
+        updated = pipeline.update_profile_tolerances(profile, updates)
+        return {"status": "updated", "active_profile": profile, "tolerances": updated}
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Profile '{profile}' not found")
 

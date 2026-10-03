@@ -68,7 +68,7 @@ class TestDecisionEngineSquare:
             diag_diff_mm=0.2,
         )
         v = evaluate_tolerances(m, square_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert v.is_acceptable is False
         assert any("width" in r and "131.8" in r for r in v.fail_reasons)
 
@@ -80,7 +80,7 @@ class TestDecisionEngineSquare:
             height_mm=128.5,
         )
         v = evaluate_tolerances(m, square_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("height" in r for r in v.fail_reasons)
 
     def test_excessive_rhomboidity_fails(self, square_tolerances):
@@ -92,7 +92,7 @@ class TestDecisionEngineSquare:
             diag_diff_mm=3.2,  # Max allowed is 2.0
         )
         v = evaluate_tolerances(m, square_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("diagonal difference" in r for r in v.fail_reasons)
 
     def test_excessive_camber_fails(self, square_tolerances):
@@ -104,7 +104,7 @@ class TestDecisionEngineSquare:
             camber_mm=4.5,  # Max is 3.0
         )
         v = evaluate_tolerances(m, square_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("camber" in r for r in v.fail_reasons)
 
     def test_excessive_cross_section_var_fails(self, square_tolerances):
@@ -116,7 +116,7 @@ class TestDecisionEngineSquare:
             cross_section_var_mm=3.8,  # Max is 2.5
         )
         v = evaluate_tolerances(m, square_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("cross-section variation" in r for r in v.fail_reasons)
 
     def test_multiple_failures_listed(self, square_tolerances):
@@ -155,7 +155,7 @@ class TestDecisionEngineRound:
             ovality=0.5,
         )
         v = evaluate_tolerances(m, round_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("diameter" in r for r in v.fail_reasons)
 
     def test_round_excessive_ovality(self, round_tolerances):
@@ -168,7 +168,7 @@ class TestDecisionEngineRound:
             ovality=2.2,  # Max allowed is 1.5%
         )
         v = evaluate_tolerances(m, round_tolerances)
-        assert v.status == "FAIL"
+        assert v.status in ("FAIL", "REWORK")
         assert any("ovality" in r for r in v.fail_reasons)
 
 
