@@ -1,32 +1,94 @@
-"""Multi-frame voting accumulator to combine multiple frame observations into a single ID."""
-from typing import List, Tuple
-from collections import Counter
+"""Multi-frame voting: accumulate OCR reads across frames for one tracked billet.
+
+Uses confidence-weighted majority voting so high-confidence reads dominate.
+"""
+from __future__ import annotations
+
+import logging
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
 from billetvision.ocr.reader import OcrResult
 
+logger = logging.getLogger(__name__)
+
+
 class MultiFrameVoter:
-    """Accumulates OCR and code reads across frames for a tracked billet."""
+    """Accumulate per-frame OcrResult observations and compute a consensus ID.
 
-    def __init__(self, min_confidence: float = 0.60):
-        self.observations: List[OcrResult] = []
+    Typical usage::
+
+        voter = MultiFrameVoter(min_confidence=0.60)
+        for frame in frames:
+            result = reader.read_best(crop)
+            voter.add(result)
+        billet_id, confidence, status = voter.decide()
+        voter.reset()
+    """
+
+    def __init__(self, min_confidence: float = 0.60) -> None:
         self.min_confidence = min_confidence
+        self._observations: List[OcrResult] = []
 
-    def add_observation(self, res: OcrResult) -> None:
-        self.observations.append(res)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    def compute_final_id(self) -> Tuple[str, float, str]:
-        """Returns (best_id, confidence, status). Status is PASS or REVIEW."""
-        if not self.observations:
+    def add(self, result: OcrResult) -> None:
+        """Record one frame's OCR result."""
+        self._observations.append(result)
+
+    # Legacy alias
+    def add_observation(self, result: OcrResult) -> None:
+        self.add(result)
+
+    def reset(self) -> None:
+        """Clear all accumulated observations (call after a billet is logged)."""
+        self._observations.clear()
+
+    @property
+    def observation_count(self) -> int:
+        return len(self._observations)
+
+    def decide(self) -> Tuple[str, float, str]:
+        """Compute consensus ID, confidence, and status.
+
+        Returns:
+            (billet_id, confidence, status) where status ∈ {"PASS", "REVIEW"}.
+        """
+        if not self._observations:
             return ("UNKNOWN", 0.0, "REVIEW")
-        
-        # QR/Barcode always takes priority if present
-        for obs in self.observations:
-            if obs.source in ("qr", "barcode") and obs.confidence > 0.8:
+
+        # QR / barcode always wins if high-confidence
+        for obs in self._observations:
+            if obs.source in ("qr", "barcode") and obs.confidence >= 0.9:
                 return (obs.text, obs.confidence, "PASS")
-        
-        counts = Counter(obs.text for obs in self.observations)
-        best_text, _ = counts.most_common(1)[0]
-        matching_confidences = [obs.confidence for obs in self.observations if obs.text == best_text]
-        avg_conf = sum(matching_confidences) / len(matching_confidences)
-        
-        status = "PASS" if avg_conf >= self.min_confidence else "REVIEW"
-        return (best_text, avg_conf, status)
+
+        # Confidence-weighted voting
+        weights: Dict[str, float] = defaultdict(float)
+        counts: Dict[str, int] = defaultdict(int)
+        for obs in self._observations:
+            if obs.text:
+                weights[obs.text] += obs.confidence
+                counts[obs.text] += 1
+
+        if not weights:
+            return ("UNKNOWN", 0.0, "REVIEW")
+
+        winner = max(weights, key=lambda t: weights[t])
+        winner_weight = weights[winner]
+        total_weight = sum(weights.values()) or 1.0
+        vote_fraction = winner_weight / total_weight
+
+        # Average confidence for the winning text
+        avg_conf = winner_weight / counts[winner]
+
+        # Blended confidence: 60% avg_conf + 40% vote_fraction
+        final_conf = 0.6 * avg_conf + 0.4 * vote_fraction
+        status = "PASS" if final_conf >= self.min_confidence else "REVIEW"
+
+        return (winner, round(final_conf, 4), status)
+
+    # Legacy alias
+    def compute_final_id(self) -> Tuple[str, float, str]:
+        return self.decide()

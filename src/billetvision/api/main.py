@@ -1,224 +1,293 @@
-"""FastAPI application entrypoint for BilletVision operator dashboard."""
+"""FastAPI application: MJPEG video, WebSocket events, REST for log/tolerances/export/review."""
+from __future__ import annotations
+
 import asyncio
-import os
-from pathlib import Path
-from typing import Dict, Any
-import yaml
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-
-from billetvision.api.ws import ws_manager
-from billetvision.api.mjpeg import frame_generator, update_frame
-from billetvision.logging_.db import init_db
-from billetvision.logging_.csv_writer import append_to_csv
-from billetvision.logging_.xlsx_writer import XlsxLogWriter
-
+import dataclasses
+import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from billetvision.api.mjpeg import frame_generator
+from billetvision.api.ws import ws_manager
+from billetvision.logging_.db import count_records, fetch_recent, update_record_status
+from billetvision.pipeline import pipeline
+
+logger = logging.getLogger(__name__)
+
+_CFG_PATH = Path("config/config.yaml")
+_WEB_DIR = Path(__file__).resolve().parent.parent.parent.parent / "web"
+
+
+def _log_cfg() -> Dict[str, Any]:
+    with _CFG_PATH.open(encoding="utf-8") as fh:
+        return yaml.safe_load(fh).get("logging", {})
+
+
+# ---------------------------------------------------------------------------
+# Lifespan: start/stop pipeline around the server lifetime
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(telemetry_background_worker())
+    loop = asyncio.get_running_loop()
+    pipeline.set_event_loop(loop)
+    try:
+        pipeline.start(event_loop=loop)
+    except Exception as exc:
+        logger.error("Pipeline failed to start: %s", exc)
     yield
-    task.cancel()
+    pipeline.stop()
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 
 app = FastAPI(title="BilletVision API", version="1.0.0", lifespan=lifespan)
 
-web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
-if web_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
-
-# Shared state
-config_path = Path("config/config.yaml")
-tolerances_path = Path("config/tolerances.yaml")
-profiles_path = Path("config/billet_profiles.yaml")
-
-active_profile = "square_130"
-live_tolerances: Dict[str, Any] = {}
-stats = {
-    "total": 0,
-    "pass_count": 0,
-    "ocr_success_count": 0,
-    "fps": 15.0,
-    "latency": 42.0
-}
-
-xlsx_writer = None
+if _WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
 
 
-def load_config():
-    global live_tolerances, active_profile, xlsx_writer
-    if tolerances_path.exists():
-        with open(tolerances_path, "r", encoding="utf-8") as f:
-            live_tolerances = yaml.safe_load(f)
-    os.makedirs("data/outputs", exist_ok=True)
-    xlsx_writer = XlsxLogWriter("data/outputs/billet_log.xlsx")
-    init_db("data/outputs/billetvision.db")
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
-
-load_config()
-
-
-async def telemetry_background_worker():
-    """Simulates active pipeline telemetry and inspection events for the live UI."""
-    seq = 0
-    while True:
-        await asyncio.sleep(8.0)
-        seq += 1
-        stats["total"] += 1
-
-        # Alternate between PASS, FAIL, and REVIEW to demonstrate all PRD features
-        mode = seq % 3
-        if mode == 1:
-            # Good Billet (PASS)
-            status = "PASS"
-            billet_id = f"H{123450 + seq}"
-            length_mm = 1000.5
-            width_mm = 130.1
-            height_mm = 129.9
-            reasons = []
-            conf = 0.96
-            stats["pass_count"] += 1
-            stats["ocr_success_count"] += 1
-        elif mode == 2:
-            # Oversized Billet (FAIL)
-            status = "FAIL"
-            billet_id = f"H{123450 + seq}"
-            length_mm = 1000.2
-            width_mm = 131.8
-            height_mm = 130.2
-            reasons = ["width 131.8 mm out of range (130.0 ± 1.0 mm)"]
-            conf = 0.93
-            stats["ocr_success_count"] += 1
-        else:
-            # Low Confidence OCR (REVIEW)
-            status = "REVIEW"
-            billet_id = f"H{123450 + seq}?"
-            length_mm = 999.8
-            width_mm = 130.0
-            height_mm = 130.0
-            reasons = ["OCR confidence below threshold (54%) - operator verification required"]
-            conf = 0.54
-            stats["pass_count"] += 1
-
-        pass_rate = (stats["pass_count"] / stats["total"]) * 100.0 if stats["total"] > 0 else 100.0
-        ocr_rate = (stats["ocr_success_count"] / stats["total"]) * 100.0 if stats["total"] > 0 else 100.0
-
-        # Broadcast telemetry KPI
-        await ws_manager.broadcast({
-            "type": "kpi_update",
-            "fps": 15.1,
-            "latency": 38.5,
-            "total": stats["total"],
-            "pass_rate": round(pass_rate, 1),
-            "ocr_rate": round(ocr_rate, 1),
-        })
-
-        # Broadcast inspection decision
-        inspection_msg = {
-            "type": "inspection_result",
-            "timestamp": asyncio.get_event_loop().time(),
-            "billet_seq": seq,
-            "billet_id": billet_id,
-            "status": status,
-            "length_mm": length_mm,
-            "width_mm": width_mm,
-            "height_mm": height_mm,
-            "ovality": 0.2,
-            "camber_mm": 0.3,
-            "ocr_confidence": conf,
-            "fail_reasons": reasons,
-        }
-        await ws_manager.broadcast(inspection_msg)
-
-        # Log atomically to CSV and Excel
-        record = {
-            "timestamp": str(asyncio.get_event_loop().time()),
-            "billet_seq": seq,
-            "billet_id": billet_id,
-            "batch_id": "BATCH-2026",
-            "length_mm": length_mm,
-            "width_mm": width_mm,
-            "height_mm": height_mm,
-            "diameter_mm": None,
-            "ovality": 0.2,
-            "diag_diff_mm": 0.2,
-            "defects": "none" if status == "PASS" else "dimensional_out_of_spec",
-            "ocr_confidence": conf,
-            "status": status,
-            "fail_reasons": "; ".join(reasons),
-            "image_path": "data/outputs/snapshots/snap.jpg",
-            "processing_ms": 38.5,
-        }
-        append_to_csv("data/outputs/billet_log.csv", record)
-        if xlsx_writer:
-            xlsx_writer.append(record)
-
-
-
-
-@app.get("/")
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def get_index():
-    index_file = web_dir / "index.html"
-    if index_file.exists():
-        return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>BilletVision API is running</h1>")
+    index = _WEB_DIR / "index.html"
+    if index.exists():
+        return HTMLResponse(content=index.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>BilletVision — pipeline running</h1>")
 
 
-@app.get("/video")
+# ---------------------------------------------------------------------------
+# MJPEG video stream
+# ---------------------------------------------------------------------------
+
+@app.get("/video", include_in_schema=False)
 def video_feed():
-    return StreamingResponse(frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+    """MJPEG stream of the annotated live feed."""
+    return StreamingResponse(
+        frame_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket events
+# ---------------------------------------------------------------------------
 
 
 @app.websocket("/events")
 async def websocket_events(websocket: WebSocket):
+    """Real-time billet events and telemetry (JSON messages)."""
     await ws_manager.connect(websocket)
     try:
         while True:
-            data = await websocket.receive_text()
+            # Keep the connection alive; pipeline pushes unsolicited events
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        await ws_manager.disconnect(websocket)
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 
 @app.get("/api/health")
-def health_check():
-    return {"status": "ok", "app": "BilletVision"}
+def health():
+    return {
+        "status": "ok",
+        "app": "BilletVision",
+        "pipeline_running": pipeline._running,
+        "queue_depth": pipeline._writer.queue_depth if pipeline._writer else 0,
+    }
 
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+@app.get("/api/stats")
+def get_stats():
+    """Live pipeline performance counters."""
+    return pipeline.stats.snapshot()
+
+
+# ---------------------------------------------------------------------------
+# Log (SQLite read)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/log")
+def get_log(
+    n: int = Query(default=50, ge=1, le=1000),
+    status: Optional[str] = Query(default=None, pattern="^(PASS|FAIL|REWORK|REVIEW)$"),
+):
+    """Return the most-recent ``n`` inspection records (newest first)."""
+    cfg = _log_cfg()
+    db_path = cfg.get("db_path", "data/outputs/billetvision.db")
+    try:
+        return fetch_recent(db_path, n=n, status=status)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/log/count")
+def log_count():
+    cfg = _log_cfg()
+    db_path = cfg.get("db_path", "data/outputs/billetvision.db")
+    return {"count": count_records(db_path)}
+
+
+# ---------------------------------------------------------------------------
+# Export (file download)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/export/csv")
+def export_csv():
+    """Download the full inspection log as CSV."""
+    cfg = _log_cfg()
+    path = Path(cfg.get("csv_path", "data/outputs/billet_log.csv"))
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="CSV log not found")
+    return FileResponse(
+        str(path),
+        media_type="text/csv",
+        filename=path.name,
+    )
+
+
+@app.get("/api/export/xlsx")
+def export_xlsx():
+    """Download the full inspection log as Excel."""
+    cfg = _log_cfg()
+    path = Path(cfg.get("xlsx_path", "data/outputs/billet_log.xlsx"))
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="XLSX log not found")
+    return FileResponse(
+        str(path),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=path.name,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tolerances / profiles
+# ---------------------------------------------------------------------------
 
 @app.get("/api/profiles")
 def get_profiles():
-    if profiles_path.exists():
-        with open(profiles_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-            return data.get("profiles", [])
-    return []
+    """List the configured billet profiles."""
+    path = Path("config/billet_profiles.yaml")
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as fh:
+        return (yaml.safe_load(fh) or {}).get("profiles", [])
 
 
 @app.get("/api/tolerances")
 def get_tolerances():
-    current = live_tolerances.get(active_profile, {})
-    return {"active_profile": active_profile, "tolerances": current}
+    """Return all tolerance profiles."""
+    return pipeline.get_tolerances()
 
 
-@app.post("/api/tolerances")
-async def update_tolerances(data: Dict[str, Any]):
-    global active_profile, live_tolerances
-    profile_id = data.get("profile_id", active_profile)
-    active_profile = profile_id
-    if profile_id in live_tolerances:
-        live_tolerances[profile_id].update(data.get("tolerances", {}))
-    return {"status": "updated", "active_profile": active_profile, "tolerances": live_tolerances.get(active_profile, {})}
+@app.get("/api/tolerances/{profile}")
+def get_profile(profile: str):
+    tols = pipeline.get_tolerances()
+    if profile not in tols:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile}' not found")
+    return tols[profile]
 
 
-@app.get("/api/export/{file_format}")
-def export_log(file_format: str):
-    fmt = file_format.lower()
-    if fmt == "csv":
-        p = Path("data/outputs/billet_log.csv")
-        if p.exists():
-            return FileResponse(path=p, filename="billet_log.csv", media_type="text/csv")
-    elif fmt == "xlsx":
-        p = Path("data/outputs/billet_log.xlsx")
-        if p.exists():
-            return FileResponse(path=p, filename="billet_log.xlsx", media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    raise HTTPException(status_code=404, detail="Log export file not found yet.")
+class ToleranceUpdate(BaseModel):
+    updates: Dict[str, Any]
+
+
+@app.put("/api/tolerances/{profile}")
+def update_tolerances(profile: str, body: ToleranceUpdate):
+    """Patch tolerance values for a profile (in-memory; restarts reverts)."""
+    try:
+        updated = pipeline.update_profile_tolerances(profile, body.updates)
+        return updated
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile}' not found")
+
+
+@app.put("/api/tolerances/{profile}/activate")
+def activate_profile(profile: str):
+    """Switch the active inspection profile."""
+    try:
+        pipeline.set_active_profile(profile)
+        return {"active_profile": profile}
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile}' not found")
+
+
+# ---------------------------------------------------------------------------
+# Review queue
+# ---------------------------------------------------------------------------
+
+class ReviewResolution(BaseModel):
+    action: str          # "approve" | "reject"
+    notes: Optional[str] = None
+
+
+@app.post("/api/review/{billet_seq}")
+def resolve_review(billet_seq: int, body: ReviewResolution):
+    """Resolve a REVIEW-status billet as PASS (approve) or FAIL (reject).
+
+    The operator can add notes which become the fail_reasons entry.
+    """
+    if body.action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'approve' or 'reject'")
+
+    new_status = "PASS" if body.action == "approve" else "FAIL"
+    fail_reasons = body.notes if body.action == "reject" else ""
+
+    cfg = _log_cfg()
+    db_path = cfg.get("db_path", "data/outputs/billetvision.db")
+    updated = update_record_status(db_path, billet_seq, new_status, fail_reasons)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"billet_seq {billet_seq} not found")
+    return {"billet_seq": billet_seq, "new_status": new_status}
+
+
+@app.get("/api/review/pending")
+def pending_reviews(n: int = Query(default=50, ge=1, le=500)):
+    """List records still in REVIEW status."""
+    cfg = _log_cfg()
+    db_path = cfg.get("db_path", "data/outputs/billetvision.db")
+    return fetch_recent(db_path, n=n, status="REVIEW")
+
+
+# ---------------------------------------------------------------------------
+# Alerts
+# ---------------------------------------------------------------------------
+
+@app.get("/api/alerts")
+def get_alerts(n: int = Query(default=50, ge=1, le=500)):
+    """Return the last ``n`` alerts (newest first)."""
+    history = pipeline.alert_manager.history[-n:]
+    return [dataclasses.asdict(a) for a in reversed(history)]
+
+
+@app.post("/api/alerts/clear")
+def clear_active_alert():
+    """Dismiss the currently active alert banner."""
+    pipeline.alert_manager.clear_active()
+    return {"ok": True}
+
+
+@app.get("/api/alerts/active")
+def active_alert():
+    a = pipeline.alert_manager.active_alert
+    return dataclasses.asdict(a) if a else None

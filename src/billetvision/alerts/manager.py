@@ -1,6 +1,6 @@
 """Alert manager: manages alert state, debouncing, and dispatching to web/audio/telegram."""
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
 @dataclass
@@ -20,7 +20,7 @@ class AlertManager:
 
     def trigger(self, billet_id: str, status: str, reasons: List[str], image_path: Optional[str] = None) -> Alert:
         alert = Alert(
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             billet_id=billet_id,
             status=status,
             reasons=reasons,
