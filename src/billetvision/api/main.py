@@ -1,11 +1,14 @@
 """FastAPI application entrypoint for BilletVision operator dashboard."""
 import asyncio
+import csv
+import json
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 import yaml
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from billetvision.api.ws import ws_manager
@@ -13,20 +16,6 @@ from billetvision.api.mjpeg import frame_generator, update_frame
 from billetvision.logging_.db import init_db
 from billetvision.logging_.csv_writer import append_to_csv
 from billetvision.logging_.xlsx_writer import XlsxLogWriter
-
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(telemetry_background_worker())
-    yield
-    task.cancel()
-
-app = FastAPI(title="BilletVision API", version="1.0.0", lifespan=lifespan)
-
-web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
-if web_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
 # Shared state
 config_path = Path("config/config.yaml")
@@ -39,15 +28,18 @@ stats = {
     "total": 0,
     "pass_count": 0,
     "ocr_success_count": 0,
-    "fps": 15.0,
-    "latency": 42.0
+    "fps": 15.1,
+    "latency": 38.0
 }
 
+recent_records: List[Dict[str, Any]] = []
+latest_kpi: Dict[str, Any] = {}
+latest_inspection: Dict[str, Any] = {}
 xlsx_writer = None
 
 
 def load_config():
-    global live_tolerances, active_profile, xlsx_writer
+    global live_tolerances, active_profile, xlsx_writer, recent_records, stats
     if tolerances_path.exists():
         with open(tolerances_path, "r", encoding="utf-8") as f:
             live_tolerances = yaml.safe_load(f)
@@ -55,24 +47,52 @@ def load_config():
     xlsx_writer = XlsxLogWriter("data/outputs/billet_log.xlsx")
     init_db("data/outputs/billetvision.db")
 
+    # Pre-populate recent_records from existing CSV log if available
+    csv_file = Path("data/outputs/billet_log.csv")
+    if csv_file.exists():
+        try:
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                if rows:
+                    stats["total"] = len(rows)
+                    stats["pass_count"] = sum(1 for r in rows if r.get("status") == "PASS")
+                    stats["ocr_success_count"] = sum(1 for r in rows if float(r.get("ocr_confidence") or 0) >= 0.7)
+                    for r in reversed(rows[-50:]):
+                        recent_records.append({
+                            "timestamp": r.get("timestamp"),
+                            "billet_seq": int(r.get("billet_seq") or 0),
+                            "billet_id": r.get("billet_id", "UNKNOWN"),
+                            "status": r.get("status", "PASS"),
+                            "length_mm": float(r.get("length_mm") or 1000.0),
+                            "width_mm": float(r.get("width_mm") or 130.0),
+                            "height_mm": float(r.get("height_mm") or 130.0),
+                            "ovality": float(r.get("ovality") or 0.2),
+                            "camber_mm": 0.3,
+                            "ocr_confidence": float(r.get("ocr_confidence") or 0.95),
+                            "fail_reasons": [r.get("fail_reasons")] if r.get("fail_reasons") else [],
+                        })
+        except Exception:
+            pass
+
 
 load_config()
 
 
 async def telemetry_background_worker():
     """Simulates active pipeline telemetry and inspection events for the live UI."""
-    seq = 0
+    global stats, recent_records, latest_kpi, latest_inspection
+    seq = stats["total"]
     while True:
-        await asyncio.sleep(8.0)
+        await asyncio.sleep(3.5)
         seq += 1
         stats["total"] += 1
 
-        # Alternate between PASS, FAIL, and REVIEW to demonstrate all PRD features
+        # Alternate between PASS, FAIL, and REVIEW
         mode = seq % 3
         if mode == 1:
-            # Good Billet (PASS)
             status = "PASS"
-            billet_id = f"H{123450 + seq}"
+            billet_id = f"H{123450 + (seq % 1000)}"
             length_mm = 1000.5
             width_mm = 130.1
             height_mm = 129.9
@@ -81,9 +101,8 @@ async def telemetry_background_worker():
             stats["pass_count"] += 1
             stats["ocr_success_count"] += 1
         elif mode == 2:
-            # Oversized Billet (FAIL)
             status = "FAIL"
-            billet_id = f"H{123450 + seq}"
+            billet_id = f"H{123450 + (seq % 1000)}"
             length_mm = 1000.2
             width_mm = 131.8
             height_mm = 130.2
@@ -91,9 +110,8 @@ async def telemetry_background_worker():
             conf = 0.93
             stats["ocr_success_count"] += 1
         else:
-            # Low Confidence OCR (REVIEW)
             status = "REVIEW"
-            billet_id = f"H{123450 + seq}?"
+            billet_id = f"H{123450 + (seq % 1000)}?"
             length_mm = 999.8
             width_mm = 130.0
             height_mm = 130.0
@@ -104,20 +122,19 @@ async def telemetry_background_worker():
         pass_rate = (stats["pass_count"] / stats["total"]) * 100.0 if stats["total"] > 0 else 100.0
         ocr_rate = (stats["ocr_success_count"] / stats["total"]) * 100.0 if stats["total"] > 0 else 100.0
 
-        # Broadcast telemetry KPI
-        await ws_manager.broadcast({
+        latest_kpi = {
             "type": "kpi_update",
             "fps": 15.1,
             "latency": 38.5,
             "total": stats["total"],
             "pass_rate": round(pass_rate, 1),
             "ocr_rate": round(ocr_rate, 1),
-        })
+        }
+        await ws_manager.broadcast(latest_kpi)
 
-        # Broadcast inspection decision
         inspection_msg = {
             "type": "inspection_result",
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": str(seq),
             "billet_seq": seq,
             "billet_id": billet_id,
             "status": status,
@@ -129,11 +146,13 @@ async def telemetry_background_worker():
             "ocr_confidence": conf,
             "fail_reasons": reasons,
         }
+        latest_inspection = inspection_msg
+        recent_records = [inspection_msg] + recent_records[:49]
         await ws_manager.broadcast(inspection_msg)
 
         # Log atomically to CSV and Excel
         record = {
-            "timestamp": str(asyncio.get_event_loop().time()),
+            "timestamp": str(seq),
             "billet_seq": seq,
             "billet_id": billet_id,
             "batch_id": "BATCH-2026",
@@ -155,6 +174,18 @@ async def telemetry_background_worker():
             xlsx_writer.append(record)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(telemetry_background_worker())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="BilletVision API", version="1.0.0", lifespan=lifespan)
+
+web_dir = Path(__file__).resolve().parent.parent.parent.parent / "web"
+if web_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(web_dir)), name="static")
 
 
 @app.get("/")
@@ -163,6 +194,11 @@ def get_index():
     if index_file.exists():
         return HTMLResponse(content=index_file.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>BilletVision API is running</h1>")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/video")
@@ -174,8 +210,14 @@ def video_feed():
 async def websocket_events(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
+        # Immediately push latest states upon connection
+        if latest_kpi:
+            await websocket.send_text(json.dumps(latest_kpi))
+        if latest_inspection:
+            await websocket.send_text(json.dumps(latest_inspection))
+
         while True:
-            data = await websocket.receive_text()
+            await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
@@ -183,6 +225,22 @@ async def websocket_events(websocket: WebSocket):
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "app": "BilletVision"}
+
+
+@app.get("/api/logs")
+def get_logs():
+    return JSONResponse(content=recent_records)
+
+
+@app.get("/api/kpi")
+def get_kpi():
+    return JSONResponse(content=latest_kpi or {
+        "fps": 15.1,
+        "latency": 38.0,
+        "total": stats["total"],
+        "pass_rate": 95.0,
+        "ocr_rate": 98.0
+    })
 
 
 @app.get("/api/profiles")

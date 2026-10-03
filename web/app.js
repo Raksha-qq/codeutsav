@@ -4,6 +4,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const wsUrl = `${wsProtocol}//${window.location.host}/events`;
   
   let ws = null;
+  let lastSeenSeq = -1;
   const audioCtx = window.AudioContext ? new (window.AudioContext || window.webkitAudioContext)() : null;
 
   function playAlertBeep(frequency = 880, duration = 0.25) {
@@ -37,7 +38,7 @@ document.addEventListener("DOMContentLoaded", () => {
     };
   }
 
-  // --- WebSocket Setup ---
+  // --- WebSocket Connection ---
   function connectWs() {
     ws = new WebSocket(wsUrl);
     const indicator = document.getElementById("stream-status");
@@ -56,27 +57,33 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     ws.onclose = () => {
-      if (indicator) indicator.textContent = "Disconnected (reconnecting...)";
-      setTimeout(connectWs, 2000);
+      if (indicator) indicator.textContent = "Disconnected (polling fallback active)";
+      setTimeout(connectWs, 2500);
     };
   }
 
   function handleWsEvent(msg) {
     if (msg.type === "kpi_update") {
-      if (msg.fps !== undefined) document.getElementById("kpi-fps").textContent = msg.fps.toFixed(1);
-      if (msg.latency !== undefined) document.getElementById("kpi-latency").textContent = `${msg.latency.toFixed(0)} ms`;
-      if (msg.total !== undefined) document.getElementById("kpi-total").textContent = msg.total;
-      if (msg.pass_rate !== undefined) document.getElementById("kpi-pass-rate").textContent = `${msg.pass_rate.toFixed(1)}%`;
-      if (msg.ocr_rate !== undefined) document.getElementById("kpi-ocr-rate").textContent = `${msg.ocr_rate.toFixed(1)}%`;
+      updateKpis(msg);
     } else if (msg.type === "inspection_result") {
+      if (msg.billet_seq && msg.billet_seq === lastSeenSeq) return;
+      lastSeenSeq = msg.billet_seq || lastSeenSeq;
       updateStatusTile(msg.status, msg.billet_id, msg.fail_reasons || msg.reasons);
-      addLogRow(msg);
+      addLogRow(msg, true);
       if (msg.status === "FAIL") {
         playAlertBeep(750, 0.4);
       } else if (msg.status === "REVIEW") {
         playAlertBeep(440, 0.2);
       }
     }
+  }
+
+  function updateKpis(msg) {
+    if (msg.fps !== undefined) document.getElementById("kpi-fps").textContent = msg.fps.toFixed(1);
+    if (msg.latency !== undefined) document.getElementById("kpi-latency").textContent = `${msg.latency.toFixed(0)} ms`;
+    if (msg.total !== undefined) document.getElementById("kpi-total").textContent = msg.total;
+    if (msg.pass_rate !== undefined) document.getElementById("kpi-pass-rate").textContent = `${msg.pass_rate.toFixed(1)}%`;
+    if (msg.ocr_rate !== undefined) document.getElementById("kpi-ocr-rate").textContent = `${msg.ocr_rate.toFixed(1)}%`;
   }
 
   function updateStatusTile(status, billetId, reasons) {
@@ -104,10 +111,20 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  function addLogRow(data) {
+  function addLogRow(data, isNew = false) {
     const tbody = document.getElementById("logs-tbody");
     if (!tbody) return;
+
+    // Check if row seq already exists
+    const existing = Array.from(tbody.querySelectorAll("tr")).find(
+      r => r.dataset.seq == data.billet_seq
+    );
+    if (existing) return;
+
     const tr = document.createElement("tr");
+    tr.dataset.seq = data.billet_seq || "";
+    if (isNew) tr.classList.add("new-row");
+
     const reasons = data.fail_reasons || data.reasons || [];
     const reasonsStr = Array.isArray(reasons) ? reasons.join("; ") : reasons;
     const st = (data.status || "PASS").toUpperCase();
@@ -123,11 +140,35 @@ document.addEventListener("DOMContentLoaded", () => {
       <td>${reasonsStr || "None"}</td>
       <td><button class="btn" style="padding:4px 8px;font-size:12px;">View</button></td>
     `;
+
     tbody.insertBefore(tr, tbody.firstChild);
 
-    // Keep table to last 100 rows
     while (tbody.children.length > 100) {
       tbody.removeChild(tbody.lastChild);
+    }
+  }
+
+  // --- Initial Logs & Polling Fallback ---
+  async function fetchLogs() {
+    try {
+      const [logsRes, kpiRes] = await Promise.all([
+        fetch("/api/logs"),
+        fetch("/api/kpi")
+      ]);
+      const logs = await logsRes.json();
+      const kpis = await kpiRes.json();
+
+      if (kpis) updateKpis(kpis);
+
+      if (logs && Array.isArray(logs) && logs.length > 0) {
+        logs.forEach(rec => addLogRow(rec, false));
+        const latest = logs[0];
+        if (latest) {
+          updateStatusTile(latest.status, latest.billet_id, latest.fail_reasons);
+        }
+      }
+    } catch (e) {
+      console.warn("Could not fetch logs:", e);
     }
   }
 
@@ -214,6 +255,11 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  // Start initialization
   loadTolerances();
+  fetchLogs();
   connectWs();
+
+  // Polling fallback keeps dashboard completely up to date
+  setInterval(fetchLogs, 3500);
 });

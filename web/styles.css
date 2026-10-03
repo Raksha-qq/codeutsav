@@ -177,3 +177,13 @@ th {
 .btn-primary {
   background: var(--accent);
 }
+
+@keyframes rowFlash {
+  0% { background-color: rgba(99, 102, 241, 0.45); }
+  100% { background-color: transparent; }
+}
+
+.new-row {
+  animation: rowFlash 1.6s ease-out;
+}
+
