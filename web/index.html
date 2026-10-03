@@ -1,112 +1,281 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>BilletVision — Operator Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="header">
-    <div class="logo-group">
-      <h1>BilletVision</h1>
-      <span class="badge">Live Inspection & Traceability</span>
+
+  <!-- ── Alert Banner ─────────────────────────────────────────────────────── -->
+  <div id="alert-banner" class="alert-banner hidden" role="alert" aria-live="assertive">
+    <span id="alert-icon" class="alert-icon">⚠</span>
+    <div class="alert-body">
+      <strong id="alert-title">OUT OF TOLERANCE</strong>
+      <span id="alert-detail"></span>
     </div>
-    <div class="kpi-group">
-      <div class="kpi-card"><span class="kpi-label">FPS</span><span id="kpi-fps" class="kpi-val">0.0</span></div>
-      <div class="kpi-card"><span class="kpi-label">Latency</span><span id="kpi-latency" class="kpi-val">0 ms</span></div>
-      <div class="kpi-card"><span class="kpi-label">Inspected</span><span id="kpi-total" class="kpi-val">0</span></div>
-      <div class="kpi-card"><span class="kpi-label">Pass Rate</span><span id="kpi-pass-rate" class="kpi-val">100%</span></div>
-      <div class="kpi-card"><span class="kpi-label">OCR Success</span><span id="kpi-ocr-rate" class="kpi-val">100%</span></div>
+    <button id="alert-dismiss" class="alert-dismiss" aria-label="Dismiss alert">✕</button>
+  </div>
+
+  <!-- ── Header ───────────────────────────────────────────────────────────── -->
+  <header class="site-header">
+    <div class="logo-group">
+      <div class="logo-mark">BV</div>
+      <div>
+        <h1 class="site-title">BilletVision</h1>
+        <p class="site-sub">Automated Billet Inspection &amp; Traceability</p>
+      </div>
+    </div>
+
+    <div class="kpi-strip">
+      <div class="kpi-card">
+        <span class="kpi-label">FPS</span>
+        <span id="kpi-fps" class="kpi-val mono">—</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Latency</span>
+        <span id="kpi-latency" class="kpi-val mono">— ms</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Inspected</span>
+        <span id="kpi-total" class="kpi-val mono">0</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Pass Rate</span>
+        <span id="kpi-pass-rate" class="kpi-val mono">—</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">OCR Rate</span>
+        <span id="kpi-ocr-rate" class="kpi-val mono">—</span>
+      </div>
+    </div>
+
+    <div class="conn-group">
+      <span id="ws-dot" class="ws-dot disconnected"></span>
+      <span id="ws-label" class="ws-label">Connecting…</span>
     </div>
   </header>
 
-  <main class="grid-container">
-    <!-- Video Stream Section -->
-    <section class="panel video-panel">
-      <div class="panel-header">
-        <h2>Live Video Feed</h2>
-        <span id="stream-status" class="status-indicator">Connected</span>
-      </div>
-      <div class="video-wrapper">
-        <img id="live-stream" src="/video" alt="BilletVision Video Feed">
-      </div>
-    </section>
+  <!-- ── Tab Navigation ───────────────────────────────────────────────────── -->
+  <nav class="tab-nav" role="tablist">
+    <button class="tab-btn active" data-tab="live" role="tab" aria-selected="true">Live Feed</button>
+    <button class="tab-btn" data-tab="log" role="tab" aria-selected="false">Audit Log</button>
+    <button class="tab-btn" data-tab="review" role="tab" aria-selected="false">
+      Review Queue
+      <span id="review-badge" class="tab-badge hidden">0</span>
+    </button>
+    <button class="tab-btn" data-tab="tolerances" role="tab" aria-selected="false">Tolerances</button>
+  </nav>
 
-    <!-- Inspection Status & Decision Tile -->
-    <section class="panel status-panel">
-      <div class="panel-header">
-        <h2>Current Decision</h2>
-      </div>
-      <div id="status-tile" class="status-tile status-idle">
-        <div id="status-text" class="status-big-text">WAITING</div>
-        <div id="status-sub" class="status-sub-text">Awaiting next billet</div>
-      </div>
-      <div id="reasons-box" class="reasons-box">
-        <h3>Inspection Details</h3>
-        <ul id="reasons-list">
-          <li>System ready for feed.</li>
-        </ul>
-      </div>
-    </section>
+  <!-- ── Tab: Live ─────────────────────────────────────────────────────────── -->
+  <div id="tab-live" class="tab-panel active">
+    <div class="live-grid">
 
-    <!-- Tolerance Editor -->
-    <section class="panel controls-panel">
-      <div class="panel-header">
-        <h2>Tolerance Configuration</h2>
-        <button id="save-tolerances-btn" class="btn btn-primary">Save Live</button>
-      </div>
-      <form id="tolerance-form" class="form-grid">
-        <label>Active Profile:
-          <select id="profile-select"></select>
-        </label>
-        <label>Nominal Width (mm):
-          <input type="number" id="tol-width-nom" step="0.1">
-        </label>
-        <label>Width Tol (± mm):
-          <input type="number" id="tol-width-tol" step="0.1">
-        </label>
-        <label>Nominal Height (mm):
-          <input type="number" id="tol-height-nom" step="0.1">
-        </label>
-        <label>Height Tol (± mm):
-          <input type="number" id="tol-height-tol" step="0.1">
-        </label>
-      </form>
-    </section>
+      <!-- Video feed -->
+      <section class="panel video-panel">
+        <div class="panel-header">
+          <h2>Live Video Feed</h2>
+          <span id="stream-status" class="stream-status">Connecting…</span>
+        </div>
+        <div class="video-frame">
+          <img id="live-stream" src="/video" alt="Live annotated feed"
+               onload="document.getElementById('stream-status').textContent='Streaming'"
+               onerror="document.getElementById('stream-status').textContent='Offline'">
+        </div>
+      </section>
 
-    <!-- Inspection Log & Review Queue -->
-    <section class="panel logs-panel full-width">
+      <!-- Right column: status tile + details -->
+      <div class="live-right">
+
+        <!-- Big status tile -->
+        <section class="panel status-panel" id="status-panel">
+          <div id="status-tile" class="status-tile idle">
+            <div id="status-text" class="status-text">WAITING</div>
+            <div id="status-billet-id" class="status-billet-id">—</div>
+          </div>
+        </section>
+
+        <!-- Measurement details -->
+        <section class="panel details-panel">
+          <div class="panel-header">
+            <h2>Measurement Details</h2>
+            <button id="drill-last-btn" class="btn btn-sm" title="Full drill-down">View Full</button>
+          </div>
+          <dl class="meas-grid" id="meas-dl">
+            <dt>Length</dt>      <dd id="m-length">—</dd>
+            <dt>Width</dt>       <dd id="m-width">—</dd>
+            <dt>Height</dt>      <dd id="m-height">—</dd>
+            <dt>Diameter</dt>    <dd id="m-diam">—</dd>
+            <dt>Ovality</dt>     <dd id="m-oval">—</dd>
+            <dt>Diag Diff</dt>   <dd id="m-diag">—</dd>
+            <dt>OCR Conf</dt>    <dd id="m-ocr">—</dd>
+            <dt>Latency</dt>     <dd id="m-ms">—</dd>
+          </dl>
+          <div id="fail-reasons-box" class="fail-reasons hidden">
+            <p class="fail-reasons-label">Fail Reasons</p>
+            <ul id="fail-reasons-list"></ul>
+          </div>
+        </section>
+
+        <!-- Recent alerts -->
+        <section class="panel alerts-panel">
+          <div class="panel-header">
+            <h2>Alert History</h2>
+            <button id="clear-alerts-btn" class="btn btn-sm btn-danger">Clear Active</button>
+          </div>
+          <ul id="alert-history-list" class="alert-list">
+            <li class="alert-empty">No alerts yet.</li>
+          </ul>
+        </section>
+
+      </div><!-- live-right -->
+    </div><!-- live-grid -->
+  </div><!-- tab-live -->
+
+
+  <!-- ── Tab: Audit Log ────────────────────────────────────────────────────── -->
+  <div id="tab-log" class="tab-panel hidden">
+    <section class="panel">
       <div class="panel-header">
-        <h2>Inspection Audit Log (Last 100)</h2>
-        <div class="actions">
-          <input type="text" id="log-search" placeholder="Filter by heat ID...">
-          <button id="export-csv-btn" class="btn">Export CSV</button>
-          <button id="export-xlsx-btn" class="btn">Export XLSX</button>
+        <h2>Inspection Audit Log</h2>
+        <div class="log-actions">
+          <input id="log-filter-id" type="text" class="filter-input" placeholder="Filter by ID…">
+          <select id="log-filter-status" class="filter-select">
+            <option value="">All statuses</option>
+            <option value="PASS">PASS</option>
+            <option value="FAIL">FAIL</option>
+            <option value="REWORK">REWORK</option>
+            <option value="REVIEW">REVIEW</option>
+          </select>
+          <button id="log-refresh-btn" class="btn btn-sm">Refresh</button>
+          <a href="/api/export/csv" id="export-csv-btn" class="btn btn-sm" download>Export CSV</a>
+          <a href="/api/export/xlsx" id="export-xlsx-btn" class="btn btn-sm" download>Export XLSX</a>
         </div>
       </div>
-      <div class="table-wrapper">
-        <table id="logs-table">
+      <div class="table-wrap">
+        <table class="data-table" id="log-table">
           <thead>
             <tr>
               <th>Timestamp</th>
               <th>Seq #</th>
-              <th>Heat / ID</th>
-              <th>Dimensions (L×W×H mm)</th>
-              <th>Ovality / Camber</th>
+              <th>Billet ID</th>
+              <th>L × W × H (mm)</th>
+              <th>Ø / Ovality</th>
+              <th>Diag Diff</th>
               <th>OCR Conf</th>
               <th>Status</th>
-              <th>Reasons</th>
-              <th>Action</th>
+              <th>Fail Reasons</th>
+              <th>Actions</th>
             </tr>
           </thead>
-          <tbody id="logs-tbody">
-            <!-- Dynamically populated -->
+          <tbody id="log-tbody">
+            <tr><td colspan="10" class="table-empty">Loading…</td></tr>
           </tbody>
         </table>
       </div>
+      <div class="table-footer">
+        <span id="log-count-label">0 records</span>
+      </div>
     </section>
-  </main>
+  </div>
+
+
+  <!-- ── Tab: Review Queue ─────────────────────────────────────────────────── -->
+  <div id="tab-review" class="tab-panel hidden">
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Review Queue</h2>
+        <button id="review-refresh-btn" class="btn btn-sm">Refresh</button>
+      </div>
+      <div id="review-cards" class="review-cards">
+        <p class="table-empty">No pending reviews.</p>
+      </div>
+    </section>
+  </div>
+
+
+  <!-- ── Tab: Tolerances ───────────────────────────────────────────────────── -->
+  <div id="tab-tolerances" class="tab-panel hidden">
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Tolerance Configuration</h2>
+        <div class="tol-header-actions">
+          <label class="tol-profile-label">Profile:
+            <select id="profile-select" class="filter-select"></select>
+          </label>
+          <button id="activate-profile-btn" class="btn btn-sm btn-accent">Activate</button>
+          <button id="save-tol-btn" class="btn btn-sm btn-primary">Save Live</button>
+        </div>
+      </div>
+
+      <div id="active-profile-badge" class="active-profile-badge hidden">
+        Active: <strong id="active-profile-name">—</strong>
+      </div>
+
+      <form id="tol-form" class="tol-form">
+        <!-- Square / rectangular -->
+        <fieldset class="tol-fieldset" id="fs-rect">
+          <legend>Rectangle Dimensions</legend>
+          <div class="tol-row">
+            <label>Nominal Width (mm)<input type="number" id="tol-width-nom" step="0.1" min="0"></label>
+            <label>Width Tolerance ± (mm)<input type="number" id="tol-width-tol" step="0.1" min="0"></label>
+          </div>
+          <div class="tol-row">
+            <label>Nominal Height (mm)<input type="number" id="tol-height-nom" step="0.1" min="0"></label>
+            <label>Height Tolerance ± (mm)<input type="number" id="tol-height-tol" step="0.1" min="0"></label>
+          </div>
+          <div class="tol-row">
+            <label>Nominal Length (mm)<input type="number" id="tol-length-nom" step="1" min="0"></label>
+            <label>Length Tolerance ± (mm)<input type="number" id="tol-length-tol" step="1" min="0"></label>
+          </div>
+        </fieldset>
+
+        <!-- Round -->
+        <fieldset class="tol-fieldset" id="fs-round">
+          <legend>Round Billet</legend>
+          <div class="tol-row">
+            <label>Nominal Diameter (mm)<input type="number" id="tol-diam-nom" step="0.1" min="0"></label>
+            <label>Diameter Tolerance ± (mm)<input type="number" id="tol-diam-tol" step="0.1" min="0"></label>
+          </div>
+          <div class="tol-row">
+            <label>Max Ovality (%)<input type="number" id="tol-ovality" step="0.1" min="0"></label>
+          </div>
+        </fieldset>
+
+        <!-- Derived -->
+        <fieldset class="tol-fieldset">
+          <legend>Derived Limits</legend>
+          <div class="tol-row">
+            <label>Max Diagonal Diff (mm)<input type="number" id="tol-diag-diff" step="0.1" min="0"></label>
+            <label>Max Camber (mm)<input type="number" id="tol-camber" step="0.1" min="0"></label>
+          </div>
+          <div class="tol-row">
+            <label>Max Cross-Section Var (mm)<input type="number" id="tol-cs-var" step="0.1" min="0"></label>
+            <label>Max Surface Anomaly Score<input type="number" id="tol-surface" step="0.01" min="0" max="1"></label>
+          </div>
+        </fieldset>
+      </form>
+
+      <div id="tol-save-status" class="tol-status hidden"></div>
+    </section>
+  </div>
+
+
+  <!-- ── Drill-down Modal ──────────────────────────────────────────────────── -->
+  <div id="modal-backdrop" class="modal-backdrop hidden" aria-modal="true" role="dialog">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="modal-title">Billet Detail</h2>
+        <button id="modal-close" class="modal-close" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body">
+        <!-- filled by JS -->
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js?v=6"></script>
 </body>
