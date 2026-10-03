@@ -21,6 +21,12 @@
 (function () {
   "use strict";
 
+  // Re-attach the MJPEG stream if it drops (pipeline restart / network blip)
+  const _liveImg = document.getElementById("live-stream");
+  if (_liveImg) {
+    _liveImg.onerror = () => setTimeout(() => { _liveImg.src = `/video?t=${Date.now()}`; }, 1000);
+  }
+
   /* ── state ──────────────────────────────────────────────────────────── */
   let _lastRecord = null;         // most-recent inspection result
   let _logRows = [];              // current visible log rows (filtered)

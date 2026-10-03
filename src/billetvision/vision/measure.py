@@ -24,10 +24,10 @@ logger = logging.getLogger(__name__)
 class Measurement:
     """Geometric measurements of a single billet in millimetres."""
 
-    shape: str  # "square" | "round"
-    length_mm: float
-    width_mm: float
-    height_mm: float
+    shape: str = "square"  # "square" | "round"
+    length_mm: float = 0.0
+    width_mm: float = 0.0
+    height_mm: float = 0.0
     diameter_mm: Optional[float] = None
     ovality: Optional[float] = None        # (max_d - min_d) / nominal_d * 100  [%]
     diag_diff_mm: Optional[float] = None   # |d1 - d2|  (rhomboidity) [mm]

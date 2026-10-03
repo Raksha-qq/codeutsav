@@ -165,3 +165,8 @@ def correct_and_validate(
 def correct_id_format(raw_text: str) -> str:
     """Normalize and apply letter→digit corrections (backward-compatible wrapper)."""
     return correct_for_digits(normalize(raw_text))
+
+
+def validate_heat_id(text: str, pattern: str = r"^[A-Z]\d{5,7}$") -> bool:
+    """Validate a heat ID string against the default (or given) regex."""
+    return validate_regex(text, pattern)

@@ -85,6 +85,7 @@ def video_feed():
 # WebSocket events
 # ---------------------------------------------------------------------------
 
+
 @app.websocket("/events")
 async def websocket_events(websocket: WebSocket):
     """Real-time billet events and telemetry (JSON messages)."""
@@ -101,10 +102,12 @@ async def websocket_events(websocket: WebSocket):
 # Health
 # ---------------------------------------------------------------------------
 
+
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
+        "app": "BilletVision",
         "pipeline_running": pipeline._running,
         "queue_depth": pipeline._writer.queue_depth if pipeline._writer else 0,
     }
@@ -178,8 +181,18 @@ def export_xlsx():
 
 
 # ---------------------------------------------------------------------------
-# Tolerances
+# Tolerances / profiles
 # ---------------------------------------------------------------------------
+
+@app.get("/api/profiles")
+def get_profiles():
+    """List the configured billet profiles."""
+    path = Path("config/billet_profiles.yaml")
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as fh:
+        return (yaml.safe_load(fh) or {}).get("profiles", [])
+
 
 @app.get("/api/tolerances")
 def get_tolerances():

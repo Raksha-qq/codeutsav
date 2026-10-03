@@ -55,6 +55,12 @@ latest_frame = LatestFrame()
 _PLACEHOLDER: Optional[bytes] = None
 
 
+def update_frame(frame_bgr: np.ndarray) -> None:
+    """Publish a frame to the MJPEG stream (alias for ``latest_frame.update``)."""
+    if frame_bgr is not None:
+        latest_frame.update(frame_bgr)
+
+
 def _placeholder_jpeg() -> bytes:
     global _PLACEHOLDER
     if _PLACEHOLDER is None:
