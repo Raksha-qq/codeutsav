@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "billetvision"
+version = "0.1.0"
+description = "Automated Billet Inspection & Traceability System"
+authors = [{ name = "BilletVision Team" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.28.0",
+    "websockets>=12.0",
+    "opencv-python>=4.9.0.80",
+    "numpy>=1.26.0",
+    "scikit-image>=0.22.0",
+    "pandas>=2.2.0",
+    "openpyxl>=3.1.2",
+    "pyyaml>=6.0.1",
+    "pydantic>=2.6.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

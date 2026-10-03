@@ -1,0 +1,36 @@
+square_130:
+  shape: "square"
+  width_nominal_mm: 130.0
+  width_tol_mm: 1.0
+  height_nominal_mm: 130.0
+  height_tol_mm: 1.0
+  length_nominal_mm: 1000.0
+  length_tol_mm: 10.0
+  max_diag_diff_mm: 2.0
+  max_camber_mm: 3.0
+  max_cross_section_var_mm: 2.5
+  max_surface_anomaly_score: 0.15
+
+square_100:
+  shape: "square"
+  width_nominal_mm: 100.0
+  width_tol_mm: 1.0
+  height_nominal_mm: 100.0
+  height_tol_mm: 1.0
+  length_nominal_mm: 1000.0
+  length_tol_mm: 10.0
+  max_diag_diff_mm: 2.0
+  max_camber_mm: 3.0
+  max_cross_section_var_mm: 2.0
+  max_surface_anomaly_score: 0.15
+
+round_150:
+  shape: "round"
+  diameter_nominal_mm: 150.0
+  diameter_tol_mm: 1.5
+  length_nominal_mm: 1000.0
+  length_tol_mm: 10.0
+  max_ovality_pct: 1.5
+  max_camber_mm: 3.0
+  max_cross_section_var_mm: 2.5
+  max_surface_anomaly_score: 0.15

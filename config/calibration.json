@@ -1,0 +1,19 @@
+{
+  "mm_per_pixel": 0.21,
+  "pixels_per_mm": 4.76190476,
+  "marker_type": "DICT_4X4_50",
+  "marker_size_mm": 50.0,
+  "calibrated_at": "2026-10-03T12:00:00Z",
+  "homography_matrix": [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "camera_matrix": [
+    [1000.0, 0.0, 640.0],
+    [0.0, 1000.0, 360.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "dist_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "reprojection_error": 0.08
+}

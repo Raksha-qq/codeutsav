@@ -1,0 +1,23 @@
+profiles:
+  - id: "square_130"
+    name: "130x130 mm Square Billet"
+    shape: "square"
+    description: "Standard continuous cast structural steel billet"
+    nominal_width_mm: 130.0
+    nominal_height_mm: 130.0
+    default_length_mm: 1000.0
+
+  - id: "square_100"
+    name: "100x100 mm Square Billet"
+    shape: "square"
+    description: "Small section rebar feedstock billet"
+    nominal_width_mm: 100.0
+    nominal_height_mm: 100.0
+    default_length_mm: 1000.0
+
+  - id: "round_150"
+    name: "Ø150 mm Round Billet"
+    shape: "round"
+    description: "Seamless tube feedstock round billet"
+    nominal_diameter_mm: 150.0
+    default_length_mm: 1000.0

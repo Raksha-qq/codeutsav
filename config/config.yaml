@@ -1,0 +1,49 @@
+system:
+  name: "BilletVision"
+  version: "1.0.0"
+  environment: "development"
+  log_level: "INFO"
+
+capture:
+  source: "data/raw/demo.mp4" # webcam index (e.g. 0), video file path, or image directory
+  fps_target: 15
+  queue_maxsize: 5
+  width: 1280
+  height: 720
+
+vision:
+  calibration_file: "config/calibration.json"
+  profiles_file: "config/billet_profiles.yaml"
+  active_profile: "square_130"
+  min_contour_area: 5000
+  roi_box: [100, 100, 1180, 620]
+  hot_billet_mode: false
+  sharpness_threshold: 100.0
+  conveyor_speed_mm_s: 250.0
+
+ocr:
+  engine: "easyocr" # "paddleocr", "easyocr", or "tesseract"
+  languages: ["en"]
+  min_confidence: 0.60
+  heat_id_regex: "^[A-Z]\\d{5,7}$"
+  enable_qr_barcode: true
+
+decision:
+  tolerances_file: "config/tolerances.yaml"
+
+logging:
+  db_path: "data/outputs/billetvision.db"
+  csv_path: "data/outputs/billet_log.csv"
+  xlsx_path: "data/outputs/billet_log.xlsx"
+  snapshot_dir: "data/outputs/snapshots"
+
+alerts:
+  telegram_enabled: false
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  webhook_url: ""
+  audio_alert_enabled: true
+
+api:
+  host: "0.0.0.0"
+  port: 8000
