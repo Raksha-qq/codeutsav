@@ -203,6 +203,15 @@ def evaluate_tolerances(
         )
         _classify_max(r, measurement.cross_section_var_mm, limit)
 
+    # --- Edge irregularity ---
+    if (
+        measurement.edge_irregularity_mm is not None
+        and "max_edge_irregularity_mm" in tol_config
+    ):
+        limit = tol_config["max_edge_irregularity_mm"]
+        r = _check_max(measurement.edge_irregularity_mm, limit, "edge irregularity")
+        _classify_max(r, measurement.edge_irregularity_mm, limit)
+
     # --- Surface anomaly score ---
     if "max_surface_anomaly_score" in tol_config:
         limit = tol_config["max_surface_anomaly_score"]

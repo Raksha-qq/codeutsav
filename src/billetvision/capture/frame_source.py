@@ -14,6 +14,8 @@ from billetvision.capture.queue import DropOldestQueue
 
 logger = logging.getLogger(__name__)
 
+_MAX_READ_FAILURES = 30      # consecutive failed webcam reads (~1 s) before the capture gives up
+_READ_RETRY_S = 0.03
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
 
@@ -37,9 +39,11 @@ class FrameSource:
         fps: Optional[float] = None,
         delay: float = 0.0,
         pace: bool = True,
+        repeat: int = 1,
         **kwargs: Any,
     ) -> None:
         self.maxsize = int(maxsize)
+        self.repeat = max(1, int(repeat))   # folder/image mode: frames emitted per image
         self.loop = bool(loop)
         self._custom_fps = float(fps) if fps is not None else None
         self.delay = float(delay)
@@ -52,8 +56,8 @@ class FrameSource:
             resolved_mode = "webcam"
         elif isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
             resolved_mode = "webcam"
-        elif Path(str(source)).is_dir():
-            resolved_mode = "folder"
+        elif Path(str(source)).is_dir() or Path(str(source)).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            resolved_mode = "folder"   # a directory of images, or one still image
         else:
             resolved_mode = "video"
 
@@ -85,6 +89,9 @@ class FrameSource:
         self._cap: Optional[cv2.VideoCapture] = None
         self._image_files: List[Path] = []
         self._effective_fps: float = 25.0
+        self._pace_fps: float = 25.0       # rate the capture thread reads at
+        self._release_on_exit = False      # worker frees the device itself if it was stuck in a read
+        self.opened = False                # webcam: whether the device actually opened
 
     def start(self) -> "FrameSource":
         """Initialize the underlying source and start the background capture thread."""
@@ -96,10 +103,15 @@ class FrameSource:
 
         if self.mode == "webcam":
             self._cap = cv2.VideoCapture(self.source)
-            if not self._cap.isOpened():
+            self.opened = bool(self._cap.isOpened())
+            if not self.opened:
                 logger.warning("Could not open webcam index %d", self.source)
+            else:
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep the driver queue short (no-op on some backends)
             val = self._cap.get(cv2.CAP_PROP_FPS) if self._cap else 0
-            self._effective_fps = self._custom_fps or (val if val and val > 0 else 30.0)
+            native = val if val and val > 0 else 30.0
+            self._effective_fps = self._custom_fps or native
+            self._pace_fps = native   # read at the camera's own rate; the drop-oldest queue keeps the newest
 
         elif self.mode == "video":
             if not self.source.exists():
@@ -109,20 +121,28 @@ class FrameSource:
                 raise RuntimeError(f"Failed to open video file: {self.source}")
             val = self._cap.get(cv2.CAP_PROP_FPS)
             self._effective_fps = self._custom_fps or (val if val and val > 0 else 25.0)
+            self._pace_fps = self._effective_fps
+            self.opened = True
 
         elif self.mode == "folder":
-            if not self.source.is_dir():
+            if self.source.is_file():
+                found = [self.source]
+            elif self.source.is_dir():
+                found = sorted(
+                    [p for p in self.source.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS],
+                    key=natural_sort_key,
+                )
+            else:
                 raise NotADirectoryError(f"Directory not found: {self.source}")
-            self._image_files = sorted(
-                [p for p in self.source.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS],
-                key=natural_sort_key,
-            )
+            self._image_files = [p for p in found for _ in range(self.repeat)]
             if not self._image_files:
                 raise RuntimeError(f"No supported images found in folder: {self.source}")
             if self.delay > 0:
                 self._effective_fps = 1.0 / self.delay
             else:
                 self._effective_fps = self._custom_fps or 15.0
+            self._pace_fps = self._effective_fps
+            self.opened = True
 
         self._running = True
         self._started = True
@@ -132,22 +152,30 @@ class FrameSource:
 
     def _capture_worker(self) -> None:
         """Worker thread pushing frames into the bounded drop-oldest queue."""
-        interval = (1.0 / self._effective_fps) if (self.pace and self._effective_fps > 0) else 0.0
+        interval = (1.0 / self._pace_fps) if (self.pace and self._pace_fps > 0) else 0.0
 
         if self.mode in ("webcam", "video"):
+            failures = 0
             while not self._stop_event.is_set():
                 t0 = time.perf_counter()
                 if self._cap is None or not self._cap.isOpened():
                     break
                 ret, frame = self._cap.read()
                 if not ret or frame is None:
-                    if self.mode == "video" and self.loop:
+                    if self.mode == "webcam":
+                        failures += 1   # a dropped frame is not a lost camera
+                        if failures < _MAX_READ_FAILURES:
+                            time.sleep(_READ_RETRY_S)
+                            continue
+                        break
+                    if self.loop:
                         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         ret, frame = self._cap.read()
                         if not ret or frame is None:
                             break
                     else:
                         break
+                failures = 0
 
                 self.queue.put(frame)
 
@@ -183,6 +211,8 @@ class FrameSource:
 
         self._eof = True
         self._running = False
+        if self._release_on_exit:
+            self._close_cap()
 
     def read(self, timeout: Optional[float] = 1.0) -> Tuple[bool, Optional[np.ndarray]]:
         """Read the next frame from the bounded queue.
@@ -219,15 +249,26 @@ class FrameSource:
             self._thread.join(timeout=timeout)
         self._running = False
 
-    def release(self) -> None:
-        """Stop capture and release all underlying resources."""
-        self.stop()
-        if self._cap is not None:
+    def _close_cap(self) -> None:
+        cap, self._cap = self._cap, None
+        if cap is not None:
             try:
-                self._cap.release()
+                cap.release()
             except Exception:
                 pass
-            self._cap = None
+
+    def release(self) -> None:
+        """Stop capture and release the device/file.
+
+        Releasing a capture while another thread is blocked in ``read()`` can crash
+        OpenCV, so if the worker has not exited in time it frees the device itself
+        when its read returns.
+        """
+        self.stop(timeout=3.0)
+        if self._thread is not None and self._thread.is_alive():
+            self._release_on_exit = True
+        else:
+            self._close_cap()
         self._started = False
         self._image_files = []
 

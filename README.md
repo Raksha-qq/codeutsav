@@ -32,8 +32,29 @@ pip install -r requirements.txt
 ### 2. Run Demonstration
 
 ```bash
-python scripts/run_demo.py --source data/raw/demo.mp4
+python scripts/run_demo.py --synthetic                 # physically consistent belt demo (generated once, ~1 min)
+python scripts/run_demo.py --source data/raw/demo.mp4  # the team's recorded mock-up
+python scripts/run_demo.py --source 0                  # webcam
 ```
+`--synthetic` renders the square props of `data/ground_truth.csv` crossing a belt at a known scale and
+speed (billets longer than the field of view, so length = belt speed × time-in-view). `demo.mp4`'s burned-in
+labels do not match its own ArUco marker, so every billet in it reads as out of tolerance; use it only to
+show the UI. Open http://localhost:8000.
+
+Other commands: `python scripts/accuracy_report.py` (writes `docs/accuracy_report.md` from real runs),
+`python scripts/ocr_eval.py`, `python scripts/soak_test.py --minutes 30`, `python scripts/calibrate.py --source webcam`,
+`python scripts/make_demo_video.py`.
+
+### Choosing the input from the dashboard
+You don't need a separate command per input. Start the dashboard once
+(`$env:PYTHONPATH="src"; uvicorn billetvision.api.main:app --port 8000`) and use the selector under the video:
+**Live Camera**, **Upload Video**, **Upload Image** or **Demo Video** (simulated conveyor; the video is rendered on
+first use, ~2 min, or run `python scripts/make_demo_video.py` beforehand). Uploads are tagged `UPLOAD-` and demo runs
+`DEMO-` in the batch ID.
+
+### OCR engines
+PaddleOCR → EasyOCR → Tesseract are used if installed. With none installed a dependency-free template-matching
+fallback (`ocr/builtin.py`) reads clean printed IDs; anything uncertain goes to the Review queue.
 
 ### 3. Start Operator Dashboard & API
 

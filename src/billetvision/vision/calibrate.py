@@ -279,6 +279,9 @@ def detect_aruco_marker(
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     dictionary = get_aruco_dictionary(marker_dict)
     parameters = cv2.aruco.DetectorParameters()
+    # Sub-pixel corners: without refinement the marker side is under-measured by
+    # ~1 px, which is a ~1% scale error on a 100 px marker.
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
     if hasattr(cv2.aruco, "ArucoDetector"):
         detector = cv2.aruco.ArucoDetector(dictionary, parameters)

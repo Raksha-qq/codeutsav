@@ -10,6 +10,7 @@ square_130:
   max_camber_mm: 3.0
   max_cross_section_var_mm: 2.5
   max_surface_anomaly_score: 0.15
+  max_edge_irregularity_mm: 3.0
 
 square_100:
   shape: "square"
@@ -23,6 +24,7 @@ square_100:
   max_camber_mm: 3.0
   max_cross_section_var_mm: 2.0
   max_surface_anomaly_score: 0.15
+  max_edge_irregularity_mm: 3.0
 
 round_150:
   shape: "round"
@@ -34,3 +36,4 @@ round_150:
   max_camber_mm: 3.0
   max_cross_section_var_mm: 2.5
   max_surface_anomaly_score: 0.15
+  max_edge_irregularity_mm: 3.0

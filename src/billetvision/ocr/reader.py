@@ -123,6 +123,20 @@ def _read_with_tesseract(image: np.ndarray, pytesseract) -> List[OcrResult]:
         return []
 
 
+def _read_with_builtin(image: np.ndarray) -> List[OcrResult]:
+    """Run the dependency-free template-matching reader on ``image``."""
+    try:
+        from billetvision.ocr import builtin
+
+        return [
+            OcrResult(text=t, confidence=c, engine="builtin")
+            for t, c in builtin.read(image)
+        ]
+    except Exception as exc:
+        logger.warning("Builtin OCR error: %s", exc)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Main reader class
 # ---------------------------------------------------------------------------
@@ -142,7 +156,9 @@ class OcrReader:
         languages: List[str] | None = None,
         min_confidence: float = 0.60,
         pattern: str = r"^[A-Z]\d{5,7}$",
+        max_variants: int = 3,
     ) -> None:
+        self.max_variants = max(1, int(max_variants))
         self.engine = engine
         self.languages = languages or ["en"]
         self.min_confidence = min_confidence
@@ -151,6 +167,7 @@ class OcrReader:
         self._paddle = None
         self._easyocr = None
         self._tesseract = None
+        self._builtin = False
         self._init_engines()
 
     def _init_engines(self) -> None:
@@ -162,6 +179,11 @@ class OcrReader:
                     logger.info("PaddleOCR initialised")
                 except Exception as exc:
                     logger.warning("PaddleOCR init failed: %s", exc)
+
+        if self.engine == "builtin":
+            self._builtin = True
+            logger.info("Builtin template OCR selected")
+            return
 
         if self._paddle is None:
             easyocr_mod = _try_import_easyocr()
@@ -177,7 +199,11 @@ class OcrReader:
             if self._tesseract:
                 logger.info("Tesseract initialised (last-resort fallback)")
             else:
-                logger.warning("No OCR engine available — all reads will return empty")
+                self._builtin = True
+                logger.warning(
+                    "No OCR engine installed (paddleocr/easyocr/pytesseract) — "
+                    "using the builtin template-matching fallback (clean printed IDs only)"
+                )
 
     # ------------------------------------------------------------------
 
@@ -190,6 +216,8 @@ class OcrReader:
             candidates.extend(_read_with_easyocr(image, self._easyocr))
         if self._tesseract is not None:
             candidates.extend(_read_with_tesseract(image, self._tesseract))
+        if self._builtin:
+            candidates.extend(_read_with_builtin(image))
         return candidates
 
     def read_candidates(self, gray: np.ndarray) -> List[OcrResult]:
@@ -198,11 +226,20 @@ class OcrReader:
         Candidates are sorted by confidence descending.
         """
         from billetvision.ocr.enhance import enhancement_variants
+        from billetvision.ocr.validate import correct_and_validate
 
         all_candidates: List[OcrResult] = []
-        variants = enhancement_variants(gray)
-        for variant in variants:
-            all_candidates.extend(self._run_engines(variant))
+        for variant in enhancement_variants(gray)[: self.max_variants]:
+            found = self._run_engines(variant)
+            all_candidates.extend(found)
+            # Early exit: a confident, format-valid read needs no more variants.
+            for r in found:
+                corrected, matched, penalty = correct_and_validate(r.text, self.pattern)
+                if matched and r.confidence - penalty >= max(self.min_confidence, 0.85):
+                    break
+            else:
+                continue
+            break
 
         # Deduplicate by text, keeping max confidence
         best: dict[str, OcrResult] = {}
@@ -268,4 +305,5 @@ class OcrReader:
             languages=ocr_cfg.get("languages", ["en"]),
             min_confidence=float(ocr_cfg.get("min_confidence", 0.60)),
             pattern=ocr_cfg.get("heat_id_regex", r"^[A-Z]\d{5,7}$"),
+            max_variants=int(ocr_cfg.get("max_variants", 3)),
         )

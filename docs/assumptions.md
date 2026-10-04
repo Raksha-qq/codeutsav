@@ -26,3 +26,17 @@ Based on PRD.pdf §5 and §12:
 - SQLite is the durable source of truth.
 - CSV is continuously appended.
 - XLSX is written to a temporary file and atomically swapped (`os.replace`). If an operator or engineer has the Excel file open, the system gracefully falls back to timestamped part files (`log_YYYYMMDD_partN.xlsx`) without blocking or losing data.
+
+## 6. Implementation decisions (added during build)
+- **Calibration scale only.** The marker gives mm/px; its homography is *not* applied unless `vision.use_homography: true`
+  (one 100 px marker extrapolates poorly across the belt). A lens distortion model from a checkerboard is applied.
+- **Measurement frames.** `direct` length mode only measures frames where the whole billet is inside the ROI;
+  `belt_speed` mode also accepts clipped frames (width only) and times head/tail across the ROI centre line.
+  Width is the side across the belt (`travel_axis: x`); height is not observable from a top view and equals width.
+- **Pixel-centre bias.** Contour extents are one pixel short; `measure.py` adds 1 px per dimension.
+- **Text notches.** Dark stamped text touching the billet edge is closed by a per-column envelope (conveyor along X).
+- **Review semantics.** The engine grades 1–2x tolerance as REWORK, >2x as FAIL (both reject).
+- **Duplicate IDs** only warn (alert + `duplicate_id` defect); they do not change the verdict.
+- **Rotation.** CSV/XLSX roll over daily to `<name>_YYYYMMDD.<ext>`; SQLite is never rotated. If Excel holds the file at
+  rollover it keeps writing to the live file and rolls on the next start.
+- **Tolerance edits** apply live but are not written back to `tolerances.yaml`.

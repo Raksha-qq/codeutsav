@@ -16,8 +16,15 @@ import cv2
 import numpy as np
 
 from billetvision.vision.calibrate import px_to_mm
+from billetvision.vision.defects import edge_irregularity_mm
 
 logger = logging.getLogger(__name__)
+
+
+# Contour points sit on the centres of the outermost foreground pixels, so every
+# contour-derived extent is one pixel short of the object's true size (a mask
+# that is N pixels wide has contour points N-1 apart).
+_PIXEL_CENTRE_BIAS_PX = 1.0
 
 
 @dataclass
@@ -33,6 +40,7 @@ class Measurement:
     diag_diff_mm: Optional[float] = None   # |d1 - d2|  (rhomboidity) [mm]
     camber_mm: Optional[float] = None
     cross_section_var_mm: Optional[float] = None
+    edge_irregularity_mm: Optional[float] = None
     surface_anomaly_score: float = 0.0
     defects: list[str] = field(default_factory=list)
 
@@ -44,22 +52,36 @@ class Measurement:
 
 def _contour_to_rect_dims(
     contour: np.ndarray,
+    travel_axis: Optional[str] = None,
 ) -> tuple[float, float, float]:
-    """Return (long_side_px, short_side_px, angle_deg) from minAreaRect.
+    """Return (length_px, width_px, angle_deg) from minAreaRect.
 
     Args:
         contour: OpenCV contour array (N,1,2).
+        travel_axis: ``"x"`` or ``"y"`` if the conveyor runs along that image
+            axis.  Length is then the rectangle side along the belt and width
+            the side across it, even for short or clipped pieces where the
+            across-belt side is the longer one.  None = length is the longer side.
 
     Returns:
-        Tuple of (length_px, width_px, angle_deg).  length >= width.
+        Tuple of (length_px, width_px, angle_deg), each side corrected for the
+        pixel-centre bias.
     """
     rect = cv2.minAreaRect(contour)
-    # rect = ((cx,cy), (w,h), angle)
-    (_, _), (rw, rh), _ = rect
-    long_side = max(rw, rh)
-    short_side = min(rw, rh)
-    angle = rect[2]
-    return float(long_side), float(short_side), float(angle)
+    (_, _), (rw, rh), angle = rect
+    if travel_axis in ("x", "y"):
+        box = cv2.boxPoints(rect)
+        edge = box[2] - box[1]  # direction of the side whose length is rw
+        axis = 0 if travel_axis == "x" else 1
+        along_is_rw = abs(edge[axis]) >= abs(edge[1 - axis])
+        length, width = (rw, rh) if along_is_rw else (rh, rw)
+    else:
+        length, width = max(rw, rh), min(rw, rh)
+    return (
+        float(length) + _PIXEL_CENTRE_BIAS_PX,
+        float(width) + _PIXEL_CENTRE_BIAS_PX,
+        float(angle),
+    )
 
 
 def _diagonal_diff_px(contour: np.ndarray) -> float:
@@ -146,6 +168,7 @@ def measure_rect(
     contour: np.ndarray,
     mm_per_px: float,
     height_px: Optional[float] = None,
+    travel_axis: Optional[str] = None,
 ) -> Measurement:
     """Measure a rectangular (square) billet from its contour.
 
@@ -159,7 +182,7 @@ def measure_rect(
     Returns:
         Measurement with all rectangular fields populated.
     """
-    length_px, width_px, _ = _contour_to_rect_dims(contour)
+    length_px, width_px, _ = _contour_to_rect_dims(contour, travel_axis)
     # If height is not observable from the top view, assume square cross-section.
     h_px = height_px if height_px is not None else width_px
 
@@ -179,6 +202,7 @@ def measure_rect(
         diag_diff_mm=round(float(diag_diff_mm), 3),
         camber_mm=round(float(camber_mm), 3),
         cross_section_var_mm=round(float(cs_var_mm), 3),
+        edge_irregularity_mm=edge_irregularity_mm(contour, mm_per_px, "square"),
         _length_px=length_px,
         _width_px=width_px,
         _height_px=h_px,
@@ -188,6 +212,7 @@ def measure_rect(
 def measure_round(
     contour: np.ndarray,
     mm_per_px: float,
+    travel_axis: Optional[str] = None,
 ) -> Measurement:
     """Measure a round billet from its contour using ellipse fitting.
 
@@ -199,19 +224,19 @@ def measure_round(
         Measurement with diameter, ovality, and round-specific fields.
     """
     # Length comes from the bounding rect long side (or belt-speed method externally)
-    length_px, _, _ = _contour_to_rect_dims(contour)
+    length_px, _, _ = _contour_to_rect_dims(contour, travel_axis)
     length_mm = px_to_mm(length_px, mm_per_px)
 
     # Fit ellipse — requires ≥5 points
     if len(contour) >= 5:
         ellipse = cv2.fitEllipse(contour)
         (_, _), (minor_axis, major_axis), _ = ellipse
-        max_d_px = float(max(minor_axis, major_axis))
-        min_d_px = float(min(minor_axis, major_axis))
+        max_d_px = float(max(minor_axis, major_axis)) + _PIXEL_CENTRE_BIAS_PX
+        min_d_px = float(min(minor_axis, major_axis)) + _PIXEL_CENTRE_BIAS_PX
     else:
         # Fallback: use enclosing circle
         _, radius = cv2.minEnclosingCircle(contour)
-        max_d_px = min_d_px = float(radius * 2)
+        max_d_px = min_d_px = float(radius * 2) + _PIXEL_CENTRE_BIAS_PX
 
     max_d_mm = px_to_mm(max_d_px, mm_per_px)
     min_d_mm = px_to_mm(min_d_px, mm_per_px)
@@ -233,6 +258,7 @@ def measure_round(
         ovality=round(float(ovality), 3),
         camber_mm=round(float(camber_mm), 3),
         cross_section_var_mm=round(float(cs_var_mm), 3),
+        edge_irregularity_mm=edge_irregularity_mm(contour, mm_per_px, "round"),
         _length_px=length_px,
         _width_px=max_d_px,
         _height_px=max_d_px,
@@ -244,6 +270,7 @@ def measure(
     mm_per_px: float,
     shape: str = "square",
     height_px: Optional[float] = None,
+    travel_axis: Optional[str] = None,
 ) -> Measurement:
     """Unified entry point: dispatch to measure_rect or measure_round.
 
@@ -252,10 +279,11 @@ def measure(
         mm_per_px: Calibrated mm/px scale.
         shape: "square" or "round".
         height_px: Height in pixels (rectangular mode only).
+        travel_axis: Conveyor axis in the image (``"x"``/``"y"``) or None.
 
     Returns:
         Measurement dataclass in millimetres.
     """
     if shape == "round":
-        return measure_round(contour, mm_per_px)
-    return measure_rect(contour, mm_per_px, height_px=height_px)
+        return measure_round(contour, mm_per_px, travel_axis=travel_axis)
+    return measure_rect(contour, mm_per_px, height_px=height_px, travel_axis=travel_axis)

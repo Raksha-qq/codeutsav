@@ -245,6 +245,7 @@ def print_report(metrics: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to cp1252
     parser = argparse.ArgumentParser(description="Evaluate OCR accuracy on test set")
     parser.add_argument(
         "--testset",

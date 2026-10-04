@@ -7,6 +7,7 @@ system:
 capture:
   source: "data/raw/demo.mp4" # webcam index (e.g. 0), video file path, or image directory
   fps_target: 15
+  loop: true                      # loop video files (demo); false = stop at end of stream
   queue_maxsize: 5
   width: 1280
   height: 720
@@ -17,14 +18,25 @@ vision:
   active_profile: "square_130"
   min_contour_area: 5000
   roi_box: [100, 100, 1180, 620]
+  direction: "left_to_right"      # conveyor direction across the image (+X = left_to_right)
+  length_mode: "direct"           # "direct" (piece fits in view) | "belt_speed" (longer than the FOV)
+  auto_calibrate: true            # derive mm/px from an ArUco marker visible at startup
+  auto_exposure: true             # gamma-normalise badly exposed frames
+  background_subtraction: true    # MOG2 fallback when thresholding finds no billet
+  use_homography: false           # warp frames with the marker homography (needs a large, well-measured marker)
+  best_n_frames: 5                # sharpest frames used for the per-billet median
+  entry_margin_px: 20
+  id_roi: null                    # [fx, fy, fw, fh] of the billet crop holding the ID; null = auto-locate
   hot_billet_mode: false
   sharpness_threshold: 100.0
   conveyor_speed_mm_s: 250.0
 
 ocr:
-  engine: "easyocr" # "paddleocr", "easyocr", or "tesseract"
+  engine: "easyocr" # "paddleocr", "easyocr", "tesseract" or "builtin"; falls back automatically (ends at builtin) if not installed
   languages: ["en"]
   min_confidence: 0.60
+  max_frames: 3                   # sharpest frames read per billet (latency guard)
+  max_variants: 3                 # enhancement variants tried per read
   heat_id_regex: "^[A-Z]\\d{5,7}$"
   enable_qr_barcode: true
 
@@ -36,6 +48,7 @@ logging:
   csv_path: "data/outputs/billet_log.csv"
   xlsx_path: "data/outputs/billet_log.xlsx"
   snapshot_dir: "data/outputs/snapshots"
+  rotate_daily: true
 
 alerts:
   telegram_enabled: false
@@ -43,6 +56,7 @@ alerts:
   telegram_chat_id: ""
   webhook_url: ""
   audio_alert_enabled: true
+  debounce_s: 10                  # collapse repeated system alerts (camera lost, ...)
 
 api:
   host: "0.0.0.0"

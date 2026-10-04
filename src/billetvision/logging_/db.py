@@ -182,28 +182,96 @@ def count_records(db_path: str | Path) -> int:
 
 def fetch_recent(
     db_path: str | Path,
-    n: int = 50,
+    n: Optional[int] = 50,
     status: Optional[str] = None,
+    q: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the last ``n`` records as a list of dicts, newest first.
 
     Args:
         db_path: Path to the SQLite file.
-        n: Maximum number of rows to return.
+        n: Maximum number of rows to return (None = all rows).
         status: Optional status filter (PASS | FAIL | REWORK | REVIEW).
+        q: Optional case-insensitive substring filter on billet_id / batch_id
+            (heat/batch lookup).
     """
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    if q:
+        clauses.append("(billet_id LIKE ? OR batch_id LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    limit = "LIMIT ?" if n is not None else ""
+    if n is not None:
+        params.append(n)
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        if status:
-            rows = conn.execute(
-                "SELECT * FROM records WHERE status=? ORDER BY id DESC LIMIT ?",
-                (status, n),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM records ORDER BY id DESC LIMIT ?", (n,)
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM records {where} ORDER BY id DESC {limit}", params
+        ).fetchall()
         return [dict(r) for r in rows]
+
+
+def fetch_record(db_path: str | Path, billet_seq: int) -> Optional[Dict[str, Any]]:
+    """Return the newest record with this ``billet_seq``, or None."""
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM records WHERE billet_seq=? ORDER BY id DESC LIMIT 1",
+            (billet_seq,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def max_billet_seq(db_path: str | Path) -> int:
+    """Highest billet_seq stored (0 when the table is empty or missing)."""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute("SELECT MAX(billet_seq) FROM records").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+    except sqlite3.Error:
+        return 0
+
+
+def billet_id_exists(db_path: str | Path, billet_id: str) -> bool:
+    """True if a record with this exact billet_id is already logged."""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM records WHERE billet_id=? LIMIT 1", (billet_id,)
+            ).fetchone()
+            return row is not None
+    except sqlite3.Error:
+        return False
+
+
+_UPDATABLE = ("billet_id", "status", "fail_reasons", "ocr_confidence", "defects")
+
+
+def update_record(
+    db_path: str | Path, billet_seq: int, fields: Dict[str, Any]
+) -> bool:
+    """Update whitelisted columns of the record with ``billet_seq``.
+
+    Returns True if a row was updated.  Unknown column names raise ValueError
+    (never interpolated into SQL).
+    """
+    bad = set(fields) - set(_UPDATABLE)
+    if bad:
+        raise ValueError(f"Cannot update columns: {sorted(bad)}")
+    if not fields:
+        return False
+    assignments = ", ".join(f"{k}=?" for k in fields)
+    with sqlite3.connect(str(db_path)) as conn:
+        cur = conn.execute(
+            f"UPDATE records SET {assignments} WHERE billet_seq=?",
+            [*fields.values(), billet_seq],
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 def update_record_status(
