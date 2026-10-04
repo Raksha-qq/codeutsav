@@ -155,6 +155,12 @@
               <input id="src-video-input" type="file" accept="video/*,.mp4,.avi,.mov,.mkv,.webm,.m4v" hidden>
               <input id="src-image-input" type="file" accept="image/*" hidden>
             </div>
+            <label class="cam-index" title="Which camera the Camera button opens">Camera #
+              <select id="src-camera-index" class="filter-select" aria-label="Camera index">
+                <option value="0">0 (default)</option><option value="1">1</option>
+                <option value="2">2</option><option value="3">3</option>
+              </select>
+            </label>
             <div class="source-status">
               <span id="src-label" class="source-label">Source: &mdash;</span>
               <span id="src-detail" class="source-detail"></span>
@@ -394,6 +400,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=10"></script>
+  <script src="/static/app.js?v=11"></script>
 </body>
 </html>

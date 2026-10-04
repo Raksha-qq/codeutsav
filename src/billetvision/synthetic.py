@@ -56,6 +56,7 @@ class Scene:
     belt_speed: float             # mm/s
     roi: tuple                    # inspection ROI (x1, y1, x2, y2) in px
     length_mode: str              # "belt_speed" (longer than the FOV) | "direct" (whole billet in view)
+    look: str = "plain"           # "plain" (exact test scene) | "realistic" (varied tone, marks, position, skew)
 
     def overrides(self) -> dict:
         """Pipeline config overrides under which this scene is read correctly."""
@@ -70,7 +71,7 @@ class Scene:
 DEFAULT_SCENE = Scene(SCALE_MM_PER_PX, MARKER_MM, GAP_MM, BELT_SPEED_MM_S, ROI_BOX, "belt_speed")
 # Operator demo: camera far enough back that a whole 1 m billet (1111 px of 1280) is in view
 # with clear belt either side, so billets read as separate pieces and are measured directly.
-DEMO_SCENE = Scene(0.9, 100.0, 400.0, 250.0, (0, 170, FRAME_W, 650), "direct")
+DEMO_SCENE = Scene(0.9, 100.0, 400.0, 250.0, (0, 170, FRAME_W, 650), "direct", look="realistic")
 HUD_H = 160                  # dark strip at the top that holds the marker
 _BG = 34
 _BILLET_BGR = (168, 164, 160)
@@ -134,22 +135,59 @@ def background(rng: np.random.Generator, with_marker: bool = True, scene: Scene 
     return bg
 
 
-def billet_texture(spec: PropSpec, width_px: int, height_px: int, rng: np.random.Generator) -> np.ndarray:
-    """Billet surface strip with a stamped ``HEAT: <id>`` label and mild texture."""
+def _stamp(tex: np.ndarray, spec: PropSpec, x: int, y_jitter: int = 0) -> None:
+    """Stamp ``HEAT: <id>`` once, starting at column ``x``."""
+    height_px, width_px = tex.shape[:2]
+    label = f"HEAT: {spec.heat_id}"
+    scale = max(0.8, height_px / 190.0)
+    thickness = max(2, int(round(scale * 2.2)))
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, scale, thickness)
+    if x + tw + 10 < width_px:
+        cv2.putText(tex, label, (x, height_px // 2 + th // 2 + y_jitter), cv2.FONT_HERSHEY_DUPLEX,
+                    scale, _TEXT_BGR, thickness, cv2.LINE_AA)
+
+
+def billet_texture(
+    spec: PropSpec, width_px: int, height_px: int, rng: np.random.Generator,
+    look: str = "plain", tone: int = 0, stamp_frac: float = 0.2,
+) -> np.ndarray:
+    """Billet surface strip with a stamped ``HEAT: <id>`` label.
+
+    ``plain`` (the test scene): uniform steel with mild texture, stamped twice along the bar.
+    ``realistic`` (the demo): per-billet steel tone, soft oxide-scale blotches, a few scratches,
+    slightly darkened long edges and a single stamp ``stamp_frac`` of the way along the bar.
+    """
     tex = np.empty((height_px, width_px, 3), dtype=np.uint8)
     tex[:] = _BILLET_BGR
     # gentle lengthwise shading + grain, so thresholds are not trivially perfect
     shade = np.linspace(-6, 6, height_px, dtype=np.float32)[:, None, None]
     grain = rng.normal(0, 3.0, tex.shape).astype(np.float32)
-    tex = np.clip(tex.astype(np.float32) + shade + grain, 0, 255).astype(np.uint8)
-    label = f"HEAT: {spec.heat_id}"
-    scale = max(0.8, height_px / 190.0)
-    thickness = max(2, int(round(scale * 2.2)))
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, scale, thickness)
-    for x in (int(0.18 * width_px), int(0.62 * width_px)):  # stamped twice along the bar
-        if x + tw + 10 < width_px:
-            cv2.putText(tex, label, (x, height_px // 2 + th // 2), cv2.FONT_HERSHEY_DUPLEX,
-                        scale, _TEXT_BGR, thickness, cv2.LINE_AA)
+    if look != "realistic":
+        tex = np.clip(tex.astype(np.float32) + shade + grain, 0, 255).astype(np.uint8)
+        for x in (int(0.18 * width_px), int(0.62 * width_px)):  # stamped twice along the bar
+            _stamp(tex, spec, x)
+        return tex
+
+    warm = rng.uniform(-5, 5, 3).astype(np.float32)               # slight per-billet colour cast
+    img = tex.astype(np.float32) + tone + warm + shade + grain
+    scale_mask = np.zeros((height_px, width_px), np.float32)
+    for _ in range(int(rng.integers(6, 11))):                      # oxide-scale blotches
+        centre = (int(rng.uniform(0, width_px)), int(rng.uniform(0, height_px)))
+        axes = (int(rng.uniform(40, 170)), int(rng.uniform(8, 40)))
+        cv2.ellipse(scale_mask, centre, axes, float(rng.uniform(-8, 8)), 0, 360, float(rng.uniform(0.4, 1.0)), -1)
+    scale_mask = cv2.GaussianBlur(scale_mask, (0, 0), 14)
+    img -= (scale_mask * rng.uniform(10, 20))[..., None]
+    for _ in range(int(rng.integers(2, 5))):                       # longitudinal scratches
+        y0 = int(rng.uniform(0.15, 0.85) * height_px)
+        x0 = int(rng.uniform(0, 0.7) * width_px)
+        x1 = x0 + int(rng.uniform(0.1, 0.3) * width_px)
+        layer = np.zeros((height_px, width_px), np.float32)
+        cv2.line(layer, (x0, y0), (x1, y0 + int(rng.integers(-3, 4))), 1.0, 1, cv2.LINE_AA)
+        img += (layer * rng.choice([-14.0, 12.0]))[..., None]
+    edge = np.minimum(np.arange(height_px), np.arange(height_px)[::-1]).astype(np.float32)
+    img *= (0.92 + 0.08 * np.clip(edge / 7.0, 0, 1))[:, None, None]  # rounded, slightly darker long edges
+    tex = np.clip(img, 0, 255).astype(np.uint8)
+    _stamp(tex, spec, int(stamp_frac * width_px), int(rng.integers(-10, 11)))
     return tex
 
 
@@ -180,6 +218,20 @@ def draw_bar(
     canvas[ya:yb, xa:xb] = np.clip(region * (1 - alpha) + layer * alpha, 0, 255).astype(np.uint8)
 
 
+def _variant(rng: np.random.Generator) -> dict:
+    """Per-billet variation for the realistic look.
+
+    No skew on purpose: any tilt adds a whole pixel (~0.8% of a 130 mm width at this scale) to the
+    contour-based width, which would push in-spec pieces into REWORK - a measurement limit, not realism.
+    """
+    return {
+        "tone": int(rng.integers(-14, 15)),          # steel brightness
+        "dy": float(rng.uniform(-45, 45)),           # lateral drift on the belt (px)
+        "gap": float(rng.uniform(0.75, 1.7)),        # gap to the next billet, x scene gap
+        "stamp": float(rng.uniform(0.08, 0.32)),     # where along the bar the heat ID is stamped
+    }
+
+
 def render_belt_frames(
     props: Sequence[PropSpec],
     seed: int = 7,
@@ -190,16 +242,17 @@ def render_belt_frames(
 ) -> Iterator[np.ndarray]:
     """Yield BGR frames of ``props`` (square billets, top view) crossing the belt.
 
-    Each billet enters from the left at ``BELT_SPEED_MM_S``; its width is the
-    caliper width, so the image is an exact, sub-pixel-accurate rendering of
-    the ground truth.  Frames carry sensor noise and slow brightness drift.
+    Each billet enters from the left at the scene's belt speed; its width is the caliper
+    width, so the image is a sub-pixel-accurate rendering of the ground truth.  Frames carry
+    sensor noise and slow brightness drift.  With ``scene.look == "realistic"`` every billet
+    also gets its own tone, surface marks, lateral position and gap.
     """
     scene = scene or DEFAULT_SCENE
+    realistic = scene.look == "realistic"
     rng = _rng(seed)
     base = background(rng, scene=scene)
     px_per_frame = scene.belt_speed / scene.scale / fps
-    gap_px = scene.gap_mm / scene.scale
-    cy = (scene.roi[1] + scene.roi[3]) / 2.0
+    cy0 = (scene.roi[1] + scene.roi[3]) / 2.0
     frame_idx = 0
     for _ in range(lead_in_frames):
         yield _finish(base, rng, noise_sigma, frame_idx)
@@ -207,9 +260,12 @@ def render_belt_frames(
     for spec in props:
         length_px = spec.length_mm / scene.scale
         width_px = (spec.width_mm or spec.diameter_mm or 130.0) / scene.scale
-        tex = billet_texture(spec, int(np.ceil(length_px)) + 2, int(np.ceil(width_px)) + 2, rng)
+        var = _variant(rng) if realistic else {"tone": 0, "dy": 0.0, "gap": 1.0, "stamp": 0.2}
+        tex = billet_texture(spec, int(np.ceil(length_px)) + 2, int(np.ceil(width_px)) + 2, rng,
+                             look=scene.look, tone=var["tone"], stamp_frac=var["stamp"])
+        cy = cy0 + var["dy"]
         x_left = -length_px - 2.0
-        travel = FRAME_W + length_px + gap_px
+        travel = FRAME_W + length_px + scene.gap_mm / scene.scale * var["gap"]
         steps = int(np.ceil(travel / px_per_frame))
         for i in range(steps):
             canvas = base.copy()
@@ -249,9 +305,9 @@ def demo_props(path: str | Path = "data/ground_truth.csv") -> List[PropSpec]:
 # Operator demo line-up: the ground-truth squares, with three pieces pushed clearly out of the
 # 130 +/- 1 mm x 1000 +/- 10 mm spec (each beyond 2x tolerance, so FAIL rather than REWORK).
 _DEMO_OVERRIDES = {
-    "PROP-04": {"width_mm": 133.5, "height_mm": 133.5},     # oversize section
-    "PROP-06": {"width_mm": 126.5, "height_mm": 126.5},     # undersize section
-    "PROP-11": {"length_mm": 960.0},                         # 40 mm short
+    "PROP-04": {"width_mm": 138.0, "height_mm": 138.0},     # oversize section (worn finishing roll)
+    "PROP-06": {"width_mm": 121.0, "height_mm": 121.0},     # undersize section
+    "PROP-11": {"length_mm": 940.0},                         # 60 mm short (cut-to-length error)
 }
 
 
@@ -264,9 +320,12 @@ def show_props(path: str | Path = "data/ground_truth.csv") -> List[PropSpec]:
     return out
 
 
+_RENDER_VERSION = 3        # bump when the demo rendering code changes, so cached videos are rebuilt
+
+
 def demo_video_name() -> str:
     """Cache file name that changes whenever the demo scene or line-up changes (no stale videos)."""
-    sig = hashlib.md5(repr((DEMO_SCENE, show_props())).encode()).hexdigest()[:8]
+    sig = hashlib.md5(repr((_RENDER_VERSION, DEMO_SCENE, show_props())).encode()).hexdigest()[:8]
     return f"demo_belt_{sig}.mp4"
 
 

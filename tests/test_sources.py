@@ -154,17 +154,6 @@ def test_uploaded_image_end_to_end_produces_one_record(tmp_path):
     assert abs(rec["length_mm"] - 300.0) / 300.0 < 0.01
 
 
-def test_api_camera_source_and_missing_camera(client):
-    with unittest.mock.patch.object(inputs, "validate_camera", return_value={"width": 640, "height": 480}), \
-            unittest.mock.patch.object(pipeline, "switch_source") as sw:
-        assert client.post("/api/source/camera?index=0").status_code == 200
-    overrides, info = sw.call_args.args
-    assert info.kind == "camera" and overrides["capture"]["source"] == 0
-    assert overrides["vision"]["roi_box"][2] <= 640          # ROI fits the webcam frame
-    with unittest.mock.patch.object(inputs, "validate_camera", side_effect=inputs.UploadError("No camera")):
-        assert client.post("/api/source/camera").status_code == 422
-
-
 def test_demo_scene_billets_fit_the_view_with_clear_gaps():
     sc = S.DEMO_SCENE
     length_px = 1000.0 / sc.scale
@@ -225,10 +214,41 @@ def test_alert_reset_clears_history_and_active():
     assert am.history == [] and am.active_alert is None
 
 
-def test_camera_already_open_is_not_reopened(client):
-    from billetvision.inputs import SourceInfo
-    with unittest.mock.patch.object(pipeline, "source_info", SourceInfo("camera", "Camera 0")), \
-            unittest.mock.patch.object(type(pipeline), "is_running", new_callable=unittest.mock.PropertyMock, return_value=True), \
-            unittest.mock.patch.object(inputs, "validate_camera") as probe:
-        r = client.post("/api/source/camera")
-    assert r.status_code == 200 and not probe.called
+def _stamp_clusters(tex) -> int:
+    """Number of separate dark-text clusters along the bar (columns containing text pixels)."""
+    dark = (tex.min(axis=2) < 70).any(axis=0)
+    edges = np.flatnonzero(np.diff(np.r_[False, dark, False].astype(np.int8)))
+    runs = list(zip(edges[::2], edges[1::2]))
+    merged = []
+    for a, b in runs:
+        if merged and a - merged[-1][1] < 80:     # glyph gaps inside one label
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return len(merged)
+
+
+def test_realistic_billet_is_stamped_once_and_plain_twice():
+    spec = S.show_props()[0]
+    rng = np.random.default_rng(1)
+    plain = S.billet_texture(spec, 1113, 146, rng, look="plain")
+    real = S.billet_texture(spec, 1113, 146, np.random.default_rng(1), look="realistic", tone=-10, stamp_frac=0.2)
+    assert _stamp_clusters(plain) == 2 and _stamp_clusters(real) == 1
+
+
+def test_demo_billets_differ_in_tone_position_and_size():
+    rng = np.random.default_rng(7)
+    variants = [S._variant(rng) for _ in range(8)]
+    assert len({v["tone"] for v in variants}) > 4 and len({round(v["dy"]) for v in variants}) > 4
+    assert len({round(v["stamp"], 2) for v in variants}) > 4
+    widths = {p.width_mm for p in S.show_props() if p.width_mm}
+    lengths = {p.length_mm for p in S.show_props()}
+    assert max(widths) - min(widths) > 15 and min(lengths) < 950      # visibly thick / thin / short pieces
+
+
+def test_default_scene_is_unchanged_by_the_realistic_look():
+    """The accuracy-report scene keeps its exact old rendering (two stamps, no variation)."""
+    assert S.DEFAULT_SCENE.look == "plain" and S.DEMO_SCENE.look == "realistic"
+    a = next(S.render_belt_frames(S.demo_props()[:1], seed=3))
+    b = next(S.render_belt_frames(S.demo_props()[:1], seed=3, scene=S.DEFAULT_SCENE))
+    assert np.array_equal(a, b)

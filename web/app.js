@@ -827,8 +827,14 @@
     } else {
       detail = `Analysing… ${counts} · ${scale}`;
     }
-    if (src.scale_source !== "marker" && (src.kind === "video" || src.kind === "image")) {
-      detail += " — no calibration marker found, so mm values use the stored scale";
+    if (src.kind === "camera" && src.camera_ok === false) {
+      detail = "Camera lost — reconnecting. Click Camera to force a retry.";
+    }
+    if (src.scale_source !== "marker" && (src.kind === "video" || src.kind === "image" || src.kind === "camera")) {
+      detail += src.kind === "camera"
+        ? " — no calibration marker in view: mm values use the stored scale and are NOT valid for this camera. " +
+          "Place the marker in view, then Tolerances → Recalibrate."
+        : " — no calibration marker found, so mm values use the stored scale";
     }
     _setText("src-detail", detail);
 
@@ -916,7 +922,10 @@
     const on = (id, ev, fn) => document.getElementById(id)?.addEventListener(ev, fn);
     on("src-demo-btn", "click",
       () => _srcCall("/api/source/demo", "Starting simulated conveyor (the first run renders the belt video, ~2 min)…"));
-    on("src-camera-btn", "click", () => _srcCall("/api/source/camera", "Opening the camera…"));
+    on("src-camera-btn", "click", () => {
+      const idx = document.getElementById("src-camera-index")?.value || "0";
+      _srcCall(`/api/source/camera?index=${encodeURIComponent(idx)}`, "Opening the camera…");
+    });
     on("src-video-btn", "click", () => document.getElementById("src-video-input")?.click());
     on("src-image-btn", "click", () => document.getElementById("src-image-input")?.click());
     on("src-video-input", "change", e => _onFilePicked("video", e.target));

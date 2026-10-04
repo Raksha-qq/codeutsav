@@ -28,7 +28,7 @@ from billetvision.logging_.db import (
     update_record,
 )
 from billetvision.ocr.validate import correct_and_validate
-from billetvision.pipeline import pipeline
+from billetvision.pipeline import SourceUnavailable, pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +177,7 @@ def _source_status() -> Dict[str, Any]:
         "boot_id": _BOOT_ID,
         "running": pipeline.is_running,
         "ended": pipeline.ended,
+        "camera_ok": pipeline.camera_ok,
         "frames_done": pipeline.frames_done,
         "results": snap["total"],
         "by_status": snap["by_status"],
@@ -185,9 +186,11 @@ def _source_status() -> Dict[str, Any]:
     }
 
 
-def _switch(overrides: Dict[str, Any], info: inputs.SourceInfo) -> Dict[str, Any]:
+def _switch(overrides: Dict[str, Any], info: inputs.SourceInfo, require_open: bool = False) -> Dict[str, Any]:
     try:
-        pipeline.switch_source(overrides, info)
+        pipeline.switch_source(overrides, info, require_open=require_open)
+    except SourceUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Could not start this source: {exc}")
     return _source_status()
@@ -262,16 +265,15 @@ def start_demo():
 
 
 @app.post("/api/source/camera")
-async def use_camera(index: int = Query(default=0, ge=0, le=9)):
-    """Analyse the live camera (frame size is probed so the ROI fits the camera)."""
-    if pipeline.is_running and pipeline.source_info.kind == "camera":
-        return _source_status()   # already open; a second open would fail while we hold the device
-    try:
-        meta = await run_in_threadpool(inputs.validate_camera, index)
-    except inputs.UploadError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+def use_camera(index: int = Query(default=0, ge=0, le=9)):
+    """Analyse live camera ``index``.  The device is opened once (by the pipeline); if it
+    does not open the previous source is restored and a 422 is returned.  Clicking this
+    while that camera is already streaming is a no-op; if it has been lost, it retries."""
     info = inputs.SourceInfo("camera", f"Camera {index}")
-    return await run_in_threadpool(_switch, inputs.camera_overrides(index, meta), info)
+    cur = pipeline.source_info
+    if pipeline.is_running and cur.kind == "camera" and cur.label == info.label and pipeline.camera_ok:
+        return _source_status()
+    return _switch(inputs.camera_overrides(index), info, require_open=True)
 
 
 @app.post("/api/source/reset")

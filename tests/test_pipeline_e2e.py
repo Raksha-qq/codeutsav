@@ -160,9 +160,13 @@ class _StubSource:
 
     def __init__(self):
         self.stopped = False
+        self.released = False
 
     def stop(self):
         self.stopped = True
+
+    def release(self):
+        self.stopped = self.released = True
 
     def start(self):
         return self
@@ -177,7 +181,7 @@ def test_camera_lost_raises_alert_and_reconnects_then_recovers(tmp_path):
     pipe._make_source = lambda: _StubSource()  # type: ignore[method-assign]
     try:
         last = pipe._on_no_frame(now=100.0, last_frame_t=90.0, last_reconnect=0.0)
-        assert last == 100.0 and not pipe.camera_ok and stub.stopped
+        assert last == 100.0 and not pipe.camera_ok and stub.released   # the old device handle is freed
         lost = [a for a in pipe.alert_manager.history if a.status == "CAMERA_LOST"]
         assert len(lost) == 1 and lost[0].kind == "camera"
         pipe._set_camera(True)

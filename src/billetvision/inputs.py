@@ -95,32 +95,22 @@ def validate_image(path: Path) -> Dict[str, Any]:
     return {"width": w, "height": h}
 
 
-def validate_camera(index: int = 0) -> Dict[str, Any]:
-    """Grab one frame from camera ``index`` (then release it) and return ``{width, height}``."""
-    cap = cv2.VideoCapture(index)
-    try:
-        ok, frame = cap.read() if cap.isOpened() else (False, None)
-        if not ok or frame is None:
-            raise UploadError(f"No camera found at index {index} (is it plugged in and not used by another app?)")
-        h, w = frame.shape[:2]
-        return {"width": w, "height": h}
-    finally:
-        cap.release()
-
-
-def camera_overrides(index: int, meta: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "system": {"batch_prefix": "LIVE"},
-        "capture": {"source": index, "loop": False, "fps_target": 15},
-        "vision": _frame_overrides(meta["width"], meta["height"]),
-    }
-
-
-def _frame_overrides(width: int, height: int) -> Dict[str, Any]:
+def frame_overrides(width: int, height: int) -> Dict[str, Any]:
+    """ROI (3% margin) and minimum contour area scaled to a ``width`` x ``height`` frame."""
     mx, my = int(width * _ROI_MARGIN), int(height * _ROI_MARGIN)
     return {
         "roi_box": [mx, my, width - mx, height - my],
         "min_contour_area": max(500, int(0.004 * width * height)),
+    }
+
+
+def camera_overrides(index: int) -> Dict[str, Any]:
+    """Live camera: the ROI is fitted to the first real frame (``vision.auto_roi``), so the
+    device is opened exactly once.  Length mode etc. stay whatever ``config.yaml`` says."""
+    return {
+        "system": {"batch_prefix": "LIVE"},
+        "capture": {"source": index, "loop": False, "fps_target": 15},
+        "vision": {"auto_roi": True},
     }
 
 
@@ -129,7 +119,7 @@ def video_overrides(path: Path, meta: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "system": {"batch_prefix": "UPLOAD"},
         "capture": {"source": str(path), "loop": False, "fps_target": min(meta["fps"], 15.0)},
-        "vision": {**_frame_overrides(meta["width"], meta["height"]), "calibration_attempts": 3},
+        "vision": {**frame_overrides(meta["width"], meta["height"]), "calibration_attempts": 3},
     }
 
 
@@ -137,7 +127,7 @@ def image_overrides(path: Path, meta: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "system": {"batch_prefix": "UPLOAD"},
         "capture": {"source": str(path), "loop": False, "fps_target": 15, "repeat": IMAGE_REPEAT},
-        "vision": {**_frame_overrides(meta["width"], meta["height"]), "calibration_attempts": 1},
+        "vision": {**frame_overrides(meta["width"], meta["height"]), "calibration_attempts": 1},
     }
 
 

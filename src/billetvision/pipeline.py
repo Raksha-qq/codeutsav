@@ -40,7 +40,7 @@ from billetvision.api.mjpeg import latest_frame
 from billetvision.api.ws import ws_manager
 from billetvision.capture.frame_source import FrameSource
 from billetvision.decision.engine import evaluate, load_tolerances
-from billetvision.inputs import SourceInfo
+from billetvision.inputs import SourceInfo, frame_overrides
 from billetvision.logging_.db import InspectionRecord, billet_id_exists, fetch_recent, max_billet_seq
 from billetvision.logging_.writer import LogWriter
 from billetvision.ocr.billet_id import IdReadout, read_billet_id
@@ -59,6 +59,10 @@ _CROP_PAD_PX = 30          # context kept around each billet crop
 _CAMERA_LOST_S = 3.0       # no frames for this long → camera lost
 _RECONNECT_S = 2.0         # retry interval while the camera is lost
 _RESULT_HOLD_S = 6.0       # how long the last result stays on the video overlay
+
+
+class SourceUnavailable(RuntimeError):
+    """The requested input could not be opened (e.g. no camera at that index)."""
 
 
 def _deep_merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,6 +182,7 @@ class BilletVisionPipeline:
         self._batch_id: str = ""
         self._billet_seq: int = 0
         self._detect_duplicates = True
+        self._roi_fitted = True            # False until the first frame when vision.auto_roi is set
         self._snapshot_dir: Path = Path("data/outputs/snapshots")
         self._db_path: str = "data/outputs/billetvision.db"
         self._roi: List[int] = [0, 0, 9999, 9999]
@@ -267,12 +272,18 @@ class BilletVisionPipeline:
             "queue_depth": self._writer.queue_depth if self._writer else 0,
         }
 
-    def switch_source(self, overrides: Dict[str, Any], info: SourceInfo) -> None:
+    @property
+    def source_opened(self) -> bool:
+        """Whether the current input actually opened (a webcam can fail to)."""
+        return self._source is not None and self._source.opened
+
+    def switch_source(self, overrides: Dict[str, Any], info: SourceInfo, require_open: bool = False) -> None:
         """Stop, point the pipeline at a different input, and start it again.
 
-        Stats, the on-video result and the active alert are reset so each run
-        starts clean; the log files keep appending.  If the new source cannot be
-        started, the previous one is restored and the error is re-raised.
+        Stats, the on-video result and the alerts are reset so each run starts
+        clean; the log files keep appending.  If the new source cannot be started
+        (or, with ``require_open``, did not open), the previous one is restored and
+        the error is re-raised.
         """
         with self._switch_lock:
             prev = (self.overrides, self.source_info)
@@ -284,15 +295,24 @@ class BilletVisionPipeline:
             self.alert_manager.reset()
             try:
                 self.start()
+                if require_open and not self.source_opened:
+                    raise SourceUnavailable(
+                        f"Could not open {info.label} (is it connected and not used by another app?)"
+                    )
             except Exception:
-                logger.exception("Could not start source %r — restoring the previous one", info.label)
-                self.overrides, self.source_info = prev
-                try:
-                    self.start()
-                except Exception:
-                    logger.exception("Could not restore the previous source either")
+                logger.exception("Could not start source %r - restoring the previous one", info.label)
+                self._restore(prev)
                 raise
         self._broadcast_sync({"type": "source_changed", **info.as_dict()})
+
+    def _restore(self, prev) -> None:
+        """Best-effort return to the previous source after a failed switch."""
+        self.stop()
+        self.overrides, self.source_info = prev
+        try:
+            self.start()
+        except Exception:
+            logger.exception("Could not restore the previous source either")
 
     # ------------------------------------------------------------------
     # Config / tolerance access for the API
@@ -444,17 +464,8 @@ class BilletVisionPipeline:
             if vis_cfg.get("auto_calibrate", True):
                 self._auto_calibrate(int(vis_cfg.get("calibration_attempts", 30)))
 
-        x1, _, x2, _ = self._roi
-        margin = int(vis_cfg.get("entry_margin_px", 20))
-        ltr = self._direction == "left_to_right"
-        self._tracker = CentroidTracker(
-            entry_x=(x1 + margin) if ltr else (x2 - margin),
-            exit_x=(x2 - margin) if ltr else (x1 + margin),
-            max_distance_px=100.0,
-            max_lost_frames=15,
-            best_n=int(vis_cfg.get("best_n_frames", 5)),
-            direction=self._direction,
-        )
+        self._build_tracker()
+        self._roi_fitted = not vis_cfg.get("auto_roi", False)
         self._bg = BackgroundModel() if vis_cfg.get("background_subtraction", True) else None
         self._ocr = OcrReader.from_config(self._cfg.get("ocr", {}))
 
@@ -473,6 +484,31 @@ class BilletVisionPipeline:
             "Pipeline components ready — profile=%s mm_per_px=%.4f length_mode=%s",
             self._profile_name, self._mm_per_px, self._length_mode,
         )
+
+    def _build_tracker(self) -> None:
+        """(Re)create the tracker with entry/exit lines derived from the current ROI."""
+        vis_cfg = self._cfg.get("vision", {})
+        x1, _, x2, _ = self._roi
+        margin = int(vis_cfg.get("entry_margin_px", 20))
+        ltr = self._direction == "left_to_right"
+        self._tracker = CentroidTracker(
+            entry_x=(x1 + margin) if ltr else (x2 - margin),
+            exit_x=(x2 - margin) if ltr else (x1 + margin),
+            max_distance_px=100.0,
+            max_lost_frames=15,
+            best_n=int(vis_cfg.get("best_n_frames", 5)),
+            direction=self._direction,
+        )
+
+    def _fit_to_frame(self, frame: np.ndarray) -> None:
+        """Size the ROI and minimum contour area to the real frame (``vision.auto_roi``)."""
+        h, w = frame.shape[:2]
+        fit = frame_overrides(w, h)
+        self._roi = [int(v) for v in fit["roi_box"]]
+        self._cfg.setdefault("vision", {})["min_contour_area"] = fit["min_contour_area"]
+        self._build_tracker()
+        self._roi_fitted = True
+        logger.info("ROI fitted to the %dx%d frame: %s", w, h, self._roi)
 
     def _make_source(self) -> FrameSource:
         cap_cfg = self._cfg.get("capture", {})
@@ -542,6 +578,8 @@ class BilletVisionPipeline:
                 self._set_camera(True)
             last_frame_t = now
             self._last_raw = frame
+            if not self._roi_fitted:
+                self._fit_to_frame(frame)
             frame_no += 1
             self.frames_done = frame_no
             t0 = time.perf_counter()
@@ -600,7 +638,7 @@ class BilletVisionPipeline:
         logger.warning("Camera lost — attempting to reconnect")
         try:
             if self._source:
-                self._source.stop()
+                self._source.release()   # the old handle must be freed or the device stays busy
             self._source = self._make_source()
             self._source.start()
         except Exception as exc:
