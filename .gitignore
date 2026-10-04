@@ -43,3 +43,6 @@ data/outputs/snapshots/*
 .idea/
 *.swp
 *.swo
+
+# operator uploads (video/image analysis)
+data/uploads/

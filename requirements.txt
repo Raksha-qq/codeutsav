@@ -10,3 +10,8 @@ pyyaml>=6.0.1
 pydantic>=2.6.0
 requests>=2.31.0
 pytest>=8.0.0
+
+# Optional (not installed by default; the pipeline degrades gracefully without them):
+#   OCR engines, best first:  paddleocr | easyocr | pytesseract (+ Tesseract binary)
+#   Barcode decoding:         pyzbar (+ libzbar)  -- QR works without it via OpenCV
+# With none installed, ocr/builtin.py (template matching, clean printed IDs only) is used.

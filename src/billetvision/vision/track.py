@@ -2,7 +2,8 @@
 
 Design
 ------
-* Each detection in a frame is a (centroid_px, contour, frame_gray) tuple.
+* Each detection in a frame is a (centroid_px, contour, frame_gray, measurement
+  [, extras]) tuple.
 * ``CentroidTracker.update()`` matches detections to existing tracks by nearest
   centroid (Hungarian-free greedy, sufficient for a single conveyor lane).
 * A track becomes ACTIVE when its centroid first crosses the entry line.
@@ -10,6 +11,8 @@ Design
   the exit line, or when it has not been seen for ``max_lost_frames`` frames.
 * ``median_measurement()`` selects the best-N frames by Laplacian-variance
   sharpness and returns a per-field median ``Measurement``.
+* A per-track timeline of (time, min_x, max_x) is kept so the pipeline can
+  derive length from belt speed x time-in-view.
 
 Coordinate frame: image origin (0,0) top-left, +X right, +Y down.
 All pixel coordinates are in the rectified/undistorted image plane.
@@ -63,9 +66,11 @@ class FrameSample:
     """One frame contribution to a track's measurement pool."""
 
     frame_gray: np.ndarray      # grayscale crop or full frame
-    contour: np.ndarray         # billet contour in full-frame pixel coords
+    contour: np.ndarray         # billet contour in ``frame_gray`` coordinates
     measurement: Measurement    # measurement derived from this frame
     sharpness_score: float      # Laplacian variance — higher = sharper
+    extras: dict = field(default_factory=dict)  # caller metadata (e.g. crop origin)
+    area_px: float = 0.0        # contour area, used to ignore partial views
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +92,9 @@ class BilletTrack:
     centroid: tuple[float, float] = (0.0, 0.0)
     centroid_history: list[tuple[float, float]] = field(default_factory=list)
     frames: list[FrameSample] = field(default_factory=list)
+    # (timestamp_s, min_x_px, max_x_px) per observed frame; only filled when the
+    # caller supplies a timestamp and extras["x_range"].
+    timeline: list[tuple[float, float, float]] = field(default_factory=list)
     lost_count: int = 0          # consecutive frames without a matching detection
     age: int = 0                 # total frames this track has been alive
     frame_index: int = 0         # pipeline frame counter at creation
@@ -106,11 +114,28 @@ class TrackedBillet:
     best_contour: np.ndarray     # contour from the sharpest frame
     centroid_path: list[tuple[float, float]]
     frame_count: int             # total frames the billet was observed
+    best_extras: dict = field(default_factory=dict)
+    top_samples: list[FrameSample] = field(default_factory=list)  # sharpest first
+    timeline: list[tuple[float, float, float]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Median measurement
 # ---------------------------------------------------------------------------
+
+# Frames showing less than this fraction of the largest observed billet area are
+# partial views (billet entering/leaving); their small, edge-dominated crops
+# score a misleadingly high sharpness, so they only rank if nothing better exists.
+_MIN_AREA_FRACTION = 0.7
+
+
+def top_samples(samples: list[FrameSample], best_n: int = 5) -> list[FrameSample]:
+    """Return the ``best_n`` sharpest near-complete samples, sharpest first (at least one)."""
+    max_area = max((s.area_px for s in samples), default=0.0)
+    pool = [s for s in samples if s.area_px >= _MIN_AREA_FRACTION * max_area] or samples
+    ranked = sorted(pool, key=lambda s: s.sharpness_score, reverse=True)
+    return ranked[: max(1, min(best_n, len(ranked)))]
+
 
 def median_measurement(
     samples: list[FrameSample],
@@ -129,8 +154,7 @@ def median_measurement(
     if not samples:
         raise ValueError("median_measurement: no samples provided")
 
-    ranked = sorted(samples, key=lambda s: s.sharpness_score, reverse=True)
-    top = ranked[: max(1, min(best_n, len(ranked)))]
+    top = top_samples(samples, best_n)
     best = top[0]
 
     def _med(values: list[Optional[float]]) -> Optional[float]:
@@ -141,9 +165,8 @@ def median_measurement(
 
     ms = [s.measurement for s in top]
 
-    shape = ms[0].shape
     med = Measurement(
-        shape=shape,
+        shape=ms[0].shape,
         length_mm=float(np.median([m.length_mm for m in ms])),
         width_mm=float(np.median([m.width_mm for m in ms])),
         height_mm=float(np.median([m.height_mm for m in ms])),
@@ -152,8 +175,9 @@ def median_measurement(
         diag_diff_mm=_med([m.diag_diff_mm for m in ms]),
         camber_mm=_med([m.camber_mm for m in ms]),
         cross_section_var_mm=_med([m.cross_section_var_mm for m in ms]),
+        edge_irregularity_mm=_med([m.edge_irregularity_mm for m in ms]),
         surface_anomaly_score=float(np.median([m.surface_anomaly_score for m in ms])),
-        defects=ms[0].defects,  # defects from best frame; union if needed
+        defects=sorted({d for m in ms for d in m.defects}),
     )
     return med, best
 
@@ -211,15 +235,23 @@ class CentroidTracker:
 
     def update(
         self,
-        detections: list[tuple[tuple[float, float], np.ndarray, np.ndarray, Measurement]],
+        detections: list[tuple],
+        timestamp: Optional[float] = None,
     ) -> list[TrackedBillet]:
         """Process one frame's detections and return any newly finalised billets.
 
         Args:
-            detections: List of (centroid_px, contour, frame_gray, measurement).
+            detections: List of (centroid_px, contour, frame_gray, measurement)
+                or (..., extras) where ``extras`` is a dict of caller metadata.
                 ``centroid_px`` is (x, y) in pixel coords.
-                ``frame_gray`` may be the full frame or a crop.
-                ``measurement`` is the per-frame Measurement from measure().
+                ``frame_gray`` may be the full frame or a crop; ``contour`` must
+                be in the coordinates of ``frame_gray``.
+                ``measurement`` is the per-frame Measurement from measure(), or
+                None when the frame should only drive tracking/timing (e.g. the
+                billet is clipped by the ROI) and not contribute a sample.
+                ``extras["x_range"] = (min_x, max_x)`` (full-frame px) feeds the
+                track timeline.
+            timestamp: Capture time of this frame in seconds (monotonic).
 
         Returns:
             List of ``TrackedBillet`` records that exited or timed out this frame.
@@ -260,25 +292,12 @@ class CentroidTracker:
         # ---- update matched tracks ------------------------------------
         for tid, det_idx in matched_pairs:
             cx, cy = detections[det_idx][0]
-            contour = detections[det_idx][1]
-            frame_gray = detections[det_idx][2]
-            meas = detections[det_idx][3]
-
             track = self._tracks[tid]
             track.centroid = (cx, cy)
             track.centroid_history.append((cx, cy))
             track.lost_count = 0
             track.age += 1
-
-            sharp = sharpness_of_contour(frame_gray, contour)
-            track.frames.append(
-                FrameSample(
-                    frame_gray=frame_gray,
-                    contour=contour,
-                    measurement=meas,
-                    sharpness_score=sharp,
-                )
-            )
+            self._record_sample(track, detections[det_idx], timestamp)
 
             # State transitions
             if track.state == TrackState.PENDING and self._past_entry(cx):
@@ -287,13 +306,13 @@ class CentroidTracker:
 
             if track.state == TrackState.ACTIVE and self._past_exit(cx):
                 track.state = TrackState.DONE
-                emitted.append(self._finalise(track))
+                self._emit(emitted, track)
                 del self._tracks[tid]
                 continue
 
         # ---- increment lost counter for unmatched tracks ----------------
+        matched_tids = {p[0] for p in matched_pairs}
         for tid in list(self._tracks.keys()):
-            matched_tids = {p[0] for p in matched_pairs}
             if tid not in matched_tids:
                 self._tracks[tid].lost_count += 1
                 if self._tracks[tid].lost_count >= self.max_lost_frames:
@@ -302,7 +321,7 @@ class CentroidTracker:
                         logger.debug(
                             "Track %d timed out after %d lost frames", tid, track.lost_count
                         )
-                        emitted.append(self._finalise(track))
+                        self._emit(emitted, track)
                     del self._tracks[tid]
 
         # ---- create new tracks for unmatched detections -----------------
@@ -314,10 +333,6 @@ class CentroidTracker:
             if self._past_exit(cx):
                 continue
 
-            contour = detections[det_idx][1]
-            frame_gray = detections[det_idx][2]
-            meas = detections[det_idx][3]
-
             tid = self._next_id
             self._next_id += 1
             track = BilletTrack(
@@ -326,16 +341,7 @@ class CentroidTracker:
                 frame_index=self._frame_index,
             )
             track.centroid_history.append((cx, cy))
-
-            sharp = sharpness_of_contour(frame_gray, contour)
-            track.frames.append(
-                FrameSample(
-                    frame_gray=frame_gray,
-                    contour=contour,
-                    measurement=meas,
-                    sharpness_score=sharp,
-                )
-            )
+            self._record_sample(track, detections[det_idx], timestamp)
 
             if self._past_entry(cx):
                 track.state = TrackState.ACTIVE
@@ -351,7 +357,7 @@ class CentroidTracker:
         for tid in list(self._tracks.keys()):
             track = self._tracks[tid]
             if track.state == TrackState.ACTIVE and track.frames:
-                emitted.append(self._finalise(track))
+                self._emit(emitted, track)
             del self._tracks[tid]
         return emitted
 
@@ -375,6 +381,47 @@ class CentroidTracker:
             return cx >= self.exit_x
         return cx <= self.exit_x
 
+    def _record_sample(
+        self, track: BilletTrack, detection: tuple, timestamp: Optional[float]
+    ) -> None:
+        """Store one detection on ``track``: timeline entry plus optional sample."""
+        contour, frame_gray, meas = detection[1], detection[2], detection[3]
+        extras = detection[4] if len(detection) > 4 else {}
+        x_range = extras.get("x_range")
+        if timestamp is not None and x_range is not None:
+            track.timeline.append((float(timestamp), float(x_range[0]), float(x_range[1])))
+        if meas is None:
+            return
+        track.frames.append(
+            FrameSample(
+                frame_gray=frame_gray,
+                contour=contour,
+                measurement=meas,
+                sharpness_score=sharpness_of_contour(frame_gray, contour),
+                extras=extras,
+                area_px=float(cv2.contourArea(contour)),
+            )
+        )
+        # Bound memory: keep only the sharpest few frames (median uses best-N).
+        keep = max(self.best_n * 3, 1)
+        if len(track.frames) > keep:
+            worst = min(range(len(track.frames)), key=lambda i: self._keep_key(track.frames, i))
+            del track.frames[worst]
+
+    @staticmethod
+    def _keep_key(frames: list[FrameSample], i: int) -> tuple[bool, float]:
+        """Eviction order: partial views first, then the least sharp."""
+        max_area = max(f.area_px for f in frames)
+        f = frames[i]
+        return (f.area_px >= _MIN_AREA_FRACTION * max_area, f.sharpness_score)
+
+    def _emit(self, emitted: list[TrackedBillet], track: BilletTrack) -> None:
+        """Finalise ``track`` into ``emitted`` unless it never produced a sample."""
+        if not track.frames:
+            logger.debug("Track %d ended without any usable frame — dropped", track.track_id)
+            return
+        emitted.append(self._finalise(track))
+
     def _finalise(self, track: BilletTrack) -> TrackedBillet:
         """Compute median measurement and return a TrackedBillet."""
         med_meas, best_sample = median_measurement(track.frames, self.best_n)
@@ -384,5 +431,8 @@ class CentroidTracker:
             best_frame_gray=best_sample.frame_gray,
             best_contour=best_sample.contour,
             centroid_path=list(track.centroid_history),
-            frame_count=len(track.frames),
+            frame_count=track.age + 1,
+            best_extras=best_sample.extras,
+            top_samples=top_samples(track.frames, self.best_n),
+            timeline=list(track.timeline),
         )

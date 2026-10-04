@@ -103,10 +103,10 @@ tests/  scripts/  docs/
 - Keep responses short: what changed, how to run it, what's next.
 
 ## Current priorities (update this block as the hackathon progresses)
-- [ ] Checkpoint 1 (~hour 8): thin slice working end to end (video → measure → log → dashboard)
-- [ ] Checkpoint 2 (~hour 15): all PS "must" bullets demoable
+- [x] Checkpoint 1 (~hour 8): thin slice working end to end (video → measure → log → dashboard)
+- [x] Checkpoint 2 (~hour 15): all PS "must" bullets demoable (see docs/accuracy_report.md for measured numbers)
 - [ ] Hour 22: feature freeze for new features. Hour 27: freeze everything.
-- Current focus: _(edit me)_
+- Current focus: install a real OCR engine and record real props; re-run `scripts/accuracy_report.py` and `scripts/ocr_eval.py` on them
 
 ## Demo safety checklist
 - Video-file demo path works offline (`--source data/raw/demo.mp4`).

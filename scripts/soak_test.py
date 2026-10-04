@@ -116,6 +116,7 @@ def _check_integrity(
 # ---------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # Windows consoles default to cp1252
     parser = argparse.ArgumentParser(description="Logging soak test")
     parser.add_argument("--minutes", type=float, default=5.0, help="Run duration (minutes)")
     parser.add_argument("--threads", type=int, default=4, help="Producer thread count")

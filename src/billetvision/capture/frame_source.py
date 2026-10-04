@@ -37,9 +37,11 @@ class FrameSource:
         fps: Optional[float] = None,
         delay: float = 0.0,
         pace: bool = True,
+        repeat: int = 1,
         **kwargs: Any,
     ) -> None:
         self.maxsize = int(maxsize)
+        self.repeat = max(1, int(repeat))   # folder/image mode: frames emitted per image
         self.loop = bool(loop)
         self._custom_fps = float(fps) if fps is not None else None
         self.delay = float(delay)
@@ -52,8 +54,8 @@ class FrameSource:
             resolved_mode = "webcam"
         elif isinstance(source, int) or (isinstance(source, str) and source.isdigit()):
             resolved_mode = "webcam"
-        elif Path(str(source)).is_dir():
-            resolved_mode = "folder"
+        elif Path(str(source)).is_dir() or Path(str(source)).suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
+            resolved_mode = "folder"   # a directory of images, or one still image
         else:
             resolved_mode = "video"
 
@@ -111,12 +113,16 @@ class FrameSource:
             self._effective_fps = self._custom_fps or (val if val and val > 0 else 25.0)
 
         elif self.mode == "folder":
-            if not self.source.is_dir():
+            if self.source.is_file():
+                found = [self.source]
+            elif self.source.is_dir():
+                found = sorted(
+                    [p for p in self.source.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS],
+                    key=natural_sort_key,
+                )
+            else:
                 raise NotADirectoryError(f"Directory not found: {self.source}")
-            self._image_files = sorted(
-                [p for p in self.source.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS],
-                key=natural_sort_key,
-            )
+            self._image_files = [p for p in found for _ in range(self.repeat)]
             if not self._image_files:
                 raise RuntimeError(f"No supported images found in folder: {self.source}")
             if self.delay > 0:

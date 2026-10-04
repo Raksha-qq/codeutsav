@@ -16,6 +16,9 @@
  *   GET /api/alerts
  *   GET /api/alerts/active
  *   POST /api/alerts/clear
+ *   GET  /api/source                    — what is being analysed + progress
+ *   POST /api/source/{video|image}?filename=   raw file body
+ *   POST /api/source/demo | /api/source/reset
  */
 
 (function () {
@@ -23,8 +26,46 @@
 
   // Re-attach the MJPEG stream if it drops (pipeline restart / network blip)
   const _liveImg = document.getElementById("live-stream");
+  /** Open a fresh MJPEG connection. A cut stream often fires no error event, so this is also
+   *  called whenever the server restarts, the WebSocket reconnects or the source changes. */
+  function _reattachStream() {
+    if (_liveImg) _liveImg.src = `/video?t=${Date.now()}`;
+  }
   if (_liveImg) {
-    _liveImg.onerror = () => setTimeout(() => { _liveImg.src = `/video?t=${Date.now()}`; }, 1000);
+    _liveImg.onerror = () => setTimeout(_reattachStream, 1000);
+  }
+
+  /* ── icons (Lucide sprite is inlined in index.html) ─────────────────── */
+  const _icon = (name, cls = "") =>
+    `<svg class="icon ${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+  const _STATUS_ICON = {
+    PASS: "circle-check", FAIL: "circle-x", REWORK: "wrench", REVIEW: "eye", IDLE: "clock",
+  };
+  function _setStatusIcon(status) {
+    const el = document.getElementById("status-icon");
+    if (el) el.innerHTML = _icon(_STATUS_ICON[(status || "IDLE").toUpperCase()] || "alert", "icon-xl");
+  }
+
+  /* ── theme toggle (light / dark, persisted per browser) ─────────────── */
+  function _initTheme() {
+    document.getElementById("theme-toggle")?.addEventListener("click", () => {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("bv-theme", next); } catch (_) {}
+    });
+  }
+
+  /* Colour the stream pill's dot from the status text */
+  function _initStreamPill() {
+    const label = document.getElementById("stream-status");
+    const pill = document.getElementById("stream-pill");
+    if (!label || !pill) return;
+    const sync = () => {
+      const t = label.textContent.toLowerCase();
+      pill.dataset.state = t === "streaming" ? "ok" : (t.includes("lost") || t === "offline") ? "bad" : "";
+    };
+    new MutationObserver(sync).observe(label, { childList: true, characterData: true, subtree: true });
+    sync();
   }
 
   /* ── state ──────────────────────────────────────────────────────────── */
@@ -62,6 +103,7 @@
   })();
 
   let _ws = null;
+  let _wsWasClosed = false;
   let _wsRetry = 1000;   // ms, doubles on failure up to 16 s
 
   function _connectWs() {
@@ -70,6 +112,7 @@
     _ws.onopen = () => {
       _wsRetry = 1000;
       _setWsStatus(true);
+      if (_wsWasClosed) { _wsWasClosed = false; _reattachStream(); _fetchAlerts(); _fetchLog(); }
     };
 
     _ws.onmessage = (ev) => {
@@ -78,6 +121,7 @@
     };
 
     _ws.onclose = () => {
+      _wsWasClosed = true;
       _setWsStatus(false);
       setTimeout(_connectWs, _wsRetry);
       _wsRetry = Math.min(_wsRetry * 2, 16000);
@@ -98,6 +142,23 @@
     if (msg.type === "kpi_update")        _onKpi(msg);
     else if (msg.type === "inspection_result") _onInspection(msg);
     else if (msg.type === "alert")        _onAlertMsg(msg);
+    else if (msg.type === "camera_status") _onCameraStatus(msg);
+    else if (msg.type === "source_changed") _onSourceChanged();
+  }
+
+  /** Reasons as an array, whether the row came from the WS (array) or the DB (";"-joined string). */
+  function _reasons(r) {
+    const v = r.reasons || r.fail_reasons || [];
+    if (Array.isArray(v)) return v;
+    return String(v).split(";").map(s => s.trim()).filter(Boolean);
+  }
+
+  /** Header indicator + stream status when the camera drops or recovers. */
+  function _onCameraStatus(msg) {
+    const lost = msg.status === "lost";
+    const el = document.getElementById("stream-status");
+    if (el) el.textContent = lost ? "CAMERA LOST" : "Streaming";
+    document.body.classList.toggle("camera-lost", lost);
   }
 
   /* ── KPI update ─────────────────────────────────────────────────────── */
@@ -119,9 +180,13 @@
     _updateMeasDetails(msg);
     _prependLogRow(msg, true);
 
-    if (msg.status === "FAIL") { _alarmBeep(); _showAlertBanner(msg); }
-    else if (msg.status === "REWORK") { _alarmBeep(); _showAlertBanner(msg); }
-    else if (msg.status === "PASS") { _passBeep(); _hideAlertBanner(); }
+    if (msg.status === "FAIL" || msg.status === "REWORK") { _alarmBeep(); _showAlertBanner(msg); }
+    else if (msg.status === "REVIEW") { _beep(660, 0.2, "triangle"); _showAlertBanner(msg); }
+    else if (msg.status === "PASS") {
+      _passBeep();
+      // a PASS must not hide a still-relevant system alert (e.g. camera lost)
+      if (document.getElementById("alert-banner")?.dataset.system !== "1") _hideAlertBanner();
+    }
 
     // update review badge count
     if (msg.status === "REVIEW") {
@@ -140,6 +205,7 @@
     const subid = document.getElementById("status-billet-id");
     if (!tile) return;
     tile.className = `status-tile ${(msg.status || "idle").toLowerCase()}`;
+    _setStatusIcon(msg.status);
     text.textContent = msg.status || "?";
     subid.textContent = msg.billet_id || "—";
   }
@@ -155,7 +221,7 @@
     _setText("m-ocr",    msg.ocr_confidence != null ? `${(msg.ocr_confidence * 100).toFixed(0)}%` : "—");
     _setText("m-ms",     msg.processing_ms  != null ? `${(+msg.processing_ms).toFixed(0)} ms` : "—");
 
-    const reasons = msg.fail_reasons || [];
+    const reasons = _reasons(msg);
     const box  = document.getElementById("fail-reasons-box");
     const list = document.getElementById("fail-reasons-list");
     if (!box) return;
@@ -173,10 +239,11 @@
     if (!banner) return;
     const title  = document.getElementById("alert-title");
     const detail = document.getElementById("alert-detail");
-    banner.className = `alert-banner ${(msg.status || "fail").toLowerCase()}`;
-    title.textContent = `${msg.status} — Billet ${msg.billet_id || "?"}`;
-    const reasons = msg.fail_reasons || msg.reasons || [];
-    detail.textContent = reasons.slice(0, 2).join(" | ");
+    const system = msg.kind && msg.kind !== "billet";
+    banner.dataset.system = system ? "1" : "";
+    banner.className = `alert-banner ${(system ? "fail" : (msg.status || "fail")).toLowerCase()}`;
+    title.textContent = system ? `${msg.status}` : `${msg.status} — Billet ${msg.billet_id || "?"}`;
+    detail.textContent = _reasons(msg).slice(0, 2).join(" | ");
     banner.classList.remove("hidden");
 
     // push to alert history list
@@ -195,11 +262,12 @@
     const empty = list.querySelector(".alert-empty");
     if (empty) empty.remove();
 
-    const reasons = (msg.fail_reasons || msg.reasons || []).slice(0, 2).join("; ");
+    const reasons = _reasons(msg).slice(0, 2).join("; ");
     const time = msg.timestamp ? msg.timestamp.slice(11, 19) : new Date().toLocaleTimeString();
     const li = document.createElement("li");
     li.className = `alert-item ${(msg.status || "").toLowerCase()}`;
     li.innerHTML = `
+      ${_icon(_STATUS_ICON[(msg.status || "").toUpperCase()] || "alert")}
       <span class="alert-item-time">${_esc(time)}</span>
       <span class="alert-item-id">${_esc(msg.billet_id || "?")}</span>
       <span class="alert-item-body">${_esc(reasons) || msg.status}</span>`;
@@ -209,8 +277,11 @@
   }
 
   function _onAlertMsg(msg) {
+    // Billet verdict alerts were already shown (banner + history) by the matching
+    // inspection_result message; system alerts (camera, duplicate ID) only arrive here.
+    if (!msg.kind || msg.kind === "billet") return;
     _showAlertBanner(msg);
-    _alarmBeep();
+    if (msg.sound !== false) _alarmBeep();
   }
 
   /* ── Log table ──────────────────────────────────────────────────────── */
@@ -254,14 +325,15 @@
         <td class="mono">${_fmtDiag(r)}</td>
         <td class="mono">${r.ocr_confidence != null ? (r.ocr_confidence*100).toFixed(0)+"%" : "—"}</td>
         <td><span class="badge-status badge-${(r.status||"").toLowerCase()}">${_esc(r.status||"—")}</span></td>
-        <td style="max-width:200px;white-space:normal;font-size:0.78rem">${_esc((r.fail_reasons||[]).join("; ")||"—")}</td>
-        <td><button class="btn btn-sm" data-drill="${_esc(JSON.stringify(r))}">Detail</button></td>
+        <td style="max-width:200px;white-space:normal;font-size:0.78rem">${_esc(_reasons(r).join("; ")||"—")}</td>
+        <td><button class="btn btn-sm btn-ghost" data-drill="${r.billet_seq}">${_icon("expand")}Details</button></td>
       </tr>`).join("");
 
-    // Attach drill-down handlers
+    // Attach drill-down handlers (the modal loads the full record from the API)
     tbody.querySelectorAll("[data-drill]").forEach(btn => {
       btn.addEventListener("click", () => {
-        try { _openModal(JSON.parse(btn.dataset.drill)); } catch (_) {}
+        const row = _logRows.find(x => String(x.billet_seq) === btn.dataset.drill);
+        if (row) _openModal(row);
       });
     });
 
@@ -287,8 +359,10 @@
 
   async function _fetchLog() {
     const stFilter = (document.getElementById("log-filter-status")?.value || "");
+    const idFilter = (document.getElementById("log-filter-id")?.value || "").trim();
     let url = `/api/log?n=${LOG_MAX}`;
     if (stFilter) url += `&status=${stFilter}`;
+    if (idFilter) url += `&q=${encodeURIComponent(idFilter)}`;
     try {
       const res = await fetch(url);
       if (!res.ok) return;
@@ -328,7 +402,10 @@
     }
     container.innerHTML = items.map(r => _reviewCardHtml(r)).join("");
     container.querySelectorAll(".review-approve-btn").forEach(btn => {
-      btn.addEventListener("click", () => _resolveReview(btn.dataset.seq, "approve", ""));
+      btn.addEventListener("click", () => {
+        const inp = container.querySelector(`input[data-seq="${btn.dataset.seq}"]`);
+        _resolveReview(btn.dataset.seq, "approve", "", inp ? inp.value.trim().toUpperCase() : "");
+      });
     });
     container.querySelectorAll(".review-reject-btn").forEach(btn => {
       btn.addEventListener("click", () => {
@@ -340,9 +417,12 @@
 
   function _reviewCardHtml(r) {
     const dims = _fmtDims(r);
-    const imgHtml = r.image_path
-      ? `<img src="/static/snapshots/${_esc(r.image_path.split(/[\\/]/).pop())}" alt="crop">`
+    // Prefer the tight ID crop; fall back to the annotated billet card.
+    const src = r.id_crop_url || r.image_url;
+    const imgHtml = src
+      ? `<img src="${_esc(src)}" alt="ID crop">`
       : `<span>No snapshot</span>`;
+    const guess = (r.billet_id || "").startsWith("UNREAD") ? "" : (r.billet_id || "");
 
     return `<div class="review-card">
       <div class="review-card-header">
@@ -351,25 +431,37 @@
       </div>
       <div class="review-card-crop">${imgHtml}</div>
       <div class="review-card-meas">${_esc(dims)} · OCR ${r.ocr_confidence != null ? (r.ocr_confidence*100).toFixed(0)+"%" : "—"}</div>
+      <div class="review-card-meas">${_esc(_reasons(r).join("; "))}</div>
       <div class="review-card-actions">
-        <input class="review-id-input" type="text" placeholder="Override ID (optional)" data-seq="${r.billet_seq}" value="${_esc(r.billet_id||"")}">
-        <button class="btn btn-pass btn-sm review-approve-btn" data-seq="${r.billet_seq}">Approve</button>
-        <button class="btn btn-fail btn-sm review-reject-btn"  data-seq="${r.billet_seq}">Reject</button>
+        <input class="review-id-input" type="text" placeholder="Type the correct ID" data-seq="${r.billet_seq}" value="${_esc(guess)}">
+        <button class="btn btn-pass btn-sm review-approve-btn" data-seq="${r.billet_seq}">${_icon("check")}Approve</button>
+        <button class="btn btn-fail btn-sm review-reject-btn"  data-seq="${r.billet_seq}">${_icon("x")}Reject</button>
       </div>
+      <div class="review-error hidden" data-err="${r.billet_seq}"></div>
     </div>`;
   }
 
-  async function _resolveReview(seq, action, notes) {
+  async function _resolveReview(seq, action, notes, correctedId) {
+    const errEl = document.querySelector(`[data-err="${seq}"]`);
     try {
+      const body = { action, notes };
+      if (action === "approve" && correctedId) body.corrected_id = correctedId;
       const res = await fetch(`/api/review/${seq}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, notes }),
+        body: JSON.stringify(body),
       });
       if (res.ok) {
         await _fetchReviewQueue();
+        _fetchLog();
+      } else if (errEl) {
+        const err = await res.json().catch(() => ({}));
+        errEl.textContent = err.detail || `Error ${res.status}`;
+        errEl.classList.remove("hidden");
       }
-    } catch (_) {}
+    } catch (e) {
+      if (errEl) { errEl.textContent = `Network error: ${e.message}`; errEl.classList.remove("hidden"); }
+    }
   }
 
   /* ── Tolerances ─────────────────────────────────────────────────────── */
@@ -408,6 +500,7 @@
     _setInputVal("tol-camber",      tol.max_camber_mm);
     _setInputVal("tol-cs-var",      tol.max_cross_section_var_mm);
     _setInputVal("tol-surface",     tol.max_surface_anomaly_score);
+    _setInputVal("tol-edge",        tol.max_edge_irregularity_mm);
   }
 
   async function _saveTolerances() {
@@ -431,6 +524,7 @@
     add("tol-camber",     "max_camber_mm");
     add("tol-cs-var",     "max_cross_section_var_mm");
     add("tol-surface",    "max_surface_anomaly_score");
+    add("tol-edge",       "max_edge_irregularity_mm");
 
     _showTolStatus("Saving…", "");
     try {
@@ -477,6 +571,41 @@
     setTimeout(() => el.classList.add("hidden"), 4000);
   }
 
+  /* ── Calibration (FR-3) ─────────────────────────────────────────────── */
+  async function _fetchCalibration() {
+    try {
+      const res = await fetch("/api/calibration");
+      if (!res.ok) return;
+      const c = await res.json();
+      _setText("cal-scale", c.mm_per_px != null ? `1 px = ${(+c.mm_per_px).toFixed(4)} mm (${(+c.px_per_mm).toFixed(2)} px/mm)` : "—");
+      _setText("cal-marker", c.marker_type ? `${c.marker_type}, ${c.marker_size_mm} mm` : "—");
+      _setText("cal-when", c.calibrated_at ? _fmtTime(c.calibrated_at) : "never");
+      _setText("cal-reproj", c.reprojection_error != null ? `${(+c.reprojection_error).toFixed(3)} px` : "—");
+    } catch (_) {}
+  }
+
+  async function _recalibrate() {
+    const el = document.getElementById("cal-status");
+    const show = (msg, cls) => {
+      if (!el) return;
+      el.textContent = msg;
+      el.className = `tol-status ${cls}`;
+      setTimeout(() => el.classList.add("hidden"), 6000);
+    };
+    const size = parseFloat(document.getElementById("cal-marker-mm")?.value || "50");
+    show("Calibrating…", "");
+    try {
+      const res = await fetch("/api/calibration/recalibrate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ marker_size_mm: size }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) { show(`Calibrated: 1 px = ${(+body.mm_per_px).toFixed(4)} mm`, "ok"); _fetchCalibration(); }
+      else show(body.detail || `Error ${res.status}`, "err");
+    } catch (e) { show(`Network error: ${e.message}`, "err"); }
+  }
+
   /* ── Alert REST ──────────────────────────────────────────────────────── */
   async function _fetchAlerts() {
     try {
@@ -488,6 +617,7 @@
       list.innerHTML = items.map(a => {
         const reasons = (a.reasons || []).slice(0, 2).join("; ");
         return `<li class="alert-item ${(a.status||"").toLowerCase()}">
+          ${_icon(_STATUS_ICON[(a.status || "").toUpperCase()] || "alert")}
           <span class="alert-item-time">${_esc(_fmtTime(a.timestamp))}</span>
           <span class="alert-item-id">${_esc(a.billet_id||"?")}</span>
           <span class="alert-item-body">${_esc(reasons) || a.status}</span>
@@ -526,13 +656,15 @@
       ? `<div class="modal-meas-item"><div class="label">${_esc(label)}</div><div class="value">${_esc(String(val))}</div></div>`
       : "";
 
-    const reasons = (record.fail_reasons || []);
+    const reasons = _reasons(record);
     const reasonsHtml = reasons.length
       ? `<ul class="modal-reasons">${reasons.map(r => `<li>${_esc(r)}</li>`).join("")}</ul>`
-      : `<p style="color:var(--text-muted);font-size:.85rem">All parameters within tolerance.</p>`;
+      : `<p style="color:var(--text-3);font-size:13px">All parameters within tolerance.</p>`;
 
-    const imgHtml = record.image_path
-      ? `<img src="/static/snapshots/${_esc(record.image_path.split(/[\\/]/).pop())}" alt="snapshot">`
+    const imgUrl = record.image_url
+      || (record.image_path ? `/snapshots/${record.image_path.split(/[\\/]/).pop()}` : null);
+    const imgHtml = imgUrl
+      ? `<img src="${_esc(imgUrl)}" alt="snapshot">`
       : `<p class="no-img">No snapshot saved.</p>`;
 
     body.innerHTML = `
@@ -576,14 +708,221 @@
       <div class="modal-section modal-snapshot">
         <h3>Snapshot</h3>
         ${imgHtml}
-      </div>`;
+      </div>
+      <div id="modal-detail"><p style="color:var(--text-3);font-size:13px">Loading frame-level detail…</p></div>`;
 
     backdrop.classList.remove("hidden");
+    if (record.billet_seq != null) _loadModalDetail(record.billet_seq);
+  }
+
+  /** Fetch /api/billet/{seq} and append the per-frame data, tolerances, OCR and frame images. */
+  async function _loadModalDetail(seq) {
+    const host = document.getElementById("modal-detail");
+    if (!host) return;
+    try {
+      const res = await fetch(`/api/billet/${seq}`);
+      const data = res.ok ? await res.json() : null;
+      const d = data && data.detail;
+      if (!d) { host.innerHTML = ""; return; }
+      const n = (v, dp = 2) => v != null ? (+v).toFixed(dp) : "—";
+      const tol = d.tolerances || {};
+      const meas = d.measurement || {};
+      const rows = [
+        ["Length", meas.length_mm, tol.length_nominal_mm, tol.length_tol_mm],
+        ["Width", meas.width_mm, tol.width_nominal_mm, tol.width_tol_mm],
+        ["Diameter", meas.diameter_mm, tol.diameter_nominal_mm, tol.diameter_tol_mm],
+      ].filter(r => r[1] != null && r[2] != null).map(r =>
+        `<tr><td>${r[0]}</td><td>${n(r[1])} mm</td><td>${n(r[2], 1)} ± ${n(r[3], 1)} mm</td></tr>`);
+      const limits = [
+        ["Camber", meas.camber_mm, tol.max_camber_mm, "mm"],
+        ["Cross-section var.", meas.cross_section_var_mm, tol.max_cross_section_var_mm, "mm"],
+        ["Edge irregularity", meas.edge_irregularity_mm, tol.max_edge_irregularity_mm, "mm"],
+        ["Surface anomaly", meas.surface_anomaly_score, tol.max_surface_anomaly_score, ""],
+        ["Diagonal diff.", meas.diag_diff_mm, tol.max_diag_diff_mm, "mm"],
+        ["Ovality", meas.ovality, tol.max_ovality_pct, "%"],
+      ].filter(r => r[1] != null && r[2] != null).map(r =>
+        `<tr><td>${r[0]}</td><td>${n(r[1], 3)} ${r[3]}</td><td>≤ ${n(r[2], 2)} ${r[3]}</td></tr>`);
+      const frames = (d.frames || []).map(f =>
+        `<tr><td>#${f.rank}</td><td>${n(f.sharpness, 0)}</td><td>${n(f.length_mm, 1)}</td><td>${n(f.width_mm, 2)}</td><td>${n(f.camber_mm, 2)}</td></tr>`);
+      const ocr = d.ocr || {};
+      const img = d.images || {};
+      const thumbs = [img.id_crop, ...(img.frames || [])].filter(Boolean)
+        .map(u => `<img src="${_esc(u)}" alt="frame" style="max-height:110px;margin:4px;border-radius:4px;border:1px solid var(--border)">`).join("");
+      host.innerHTML = `
+        <div class="modal-section"><h3>Measured vs tolerance (profile ${_esc(d.profile || "?")}, ${n(d.mm_per_px, 4)} mm/px, length: ${_esc(d.length_mode || "direct")})</h3>
+          <table class="data-table"><thead><tr><th>Parameter</th><th>Measured</th><th>Limit</th></tr></thead>
+          <tbody>${rows.concat(limits).join("")}</tbody></table></div>
+        <div class="modal-section"><h3>OCR / ID decision</h3>
+          <div class="modal-meas-grid">
+            <div class="modal-meas-item"><div class="label">Read</div><div class="value">${_esc(ocr.text || "—")}</div></div>
+            <div class="modal-meas-item"><div class="label">Confidence</div><div class="value">${n((ocr.confidence || 0) * 100, 0)}%</div></div>
+            <div class="modal-meas-item"><div class="label">Format valid</div><div class="value">${ocr.format_valid ? "yes" : "no"}</div></div>
+            <div class="modal-meas-item"><div class="label">Candidates</div><div class="value">${_esc((ocr.candidates || []).join(", ") || "—")}</div></div>
+          </div></div>
+        <div class="modal-section"><h3>Best frames used for the median (${d.frames_observed ?? "?"} observed)</h3>
+          <table class="data-table"><thead><tr><th>Rank</th><th>Sharpness</th><th>Length mm</th><th>Width mm</th><th>Camber mm</th></tr></thead>
+          <tbody>${frames.join("")}</tbody></table>
+          <div style="margin-top:8px">${thumbs}</div></div>`;
+    } catch (_) { host.innerHTML = ""; }
   }
 
   function _closeModal() {
     const backdrop = document.getElementById("modal-backdrop");
     if (backdrop) backdrop.classList.add("hidden");
+  }
+
+  /* ── Input source: upload video / image, simulated demo ─────────────── */
+  const _SRC_BTNS = ["src-camera-btn", "src-demo-btn", "src-video-btn", "src-image-btn"];
+  const _KIND_NAME = { video: "Uploaded video", image: "Uploaded image", demo: "Simulated demo", camera: "Live camera", configured: "Configured source" };
+
+  function _srcBusy(busy) {
+    _SRC_BTNS.forEach(id => { const b = document.getElementById(id); if (b) b.disabled = busy; });
+  }
+
+  function _srcMessage(text, ok) {
+    const el = document.getElementById("src-message");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = "tol-status " + (text ? (ok ? "ok" : "err") : "hidden");
+  }
+
+  function _srcProgress(frac) {
+    const wrap = document.getElementById("src-progress");
+    const bar = document.getElementById("src-progress-bar");
+    if (!wrap || !bar) return;
+    wrap.classList.toggle("hidden", frac == null);
+    if (frac != null) bar.style.width = `${Math.round(Math.min(1, Math.max(0, frac)) * 100)}%`;
+  }
+
+  /** A new source started: clear the previous run's tile, details and banner. */
+  function _onSourceChanged() {
+    _lastRecord = null;
+    _lastSeenSeq = -1;           // sequence numbers continue, but never skip the new run's first result
+    const tile = document.getElementById("status-tile");
+    if (tile) tile.className = "status-tile idle";
+    _setStatusIcon("IDLE");
+    _setText("status-text", "WAITING");
+    _setText("status-billet-id", "—");
+    _updateMeasDetails({});
+    _hideAlertBanner();
+    _reattachStream();           // always start the new source on a fresh video connection
+    _fetchAlerts();              // the server cleared the previous source's alerts
+    _fetchSource();
+  }
+
+  function _renderSource(src) {
+    document.querySelectorAll(".source-select .seg").forEach(b => b.classList.toggle("active", b.dataset.kind === src.kind));
+    _setText("src-label", `Source: ${_KIND_NAME[src.kind] || src.kind} — ${src.label}`);
+    const bs = src.by_status || {};
+    const counts = `${src.results} billet${src.results === 1 ? "" : "s"} (` +
+      `${bs.PASS || 0} pass, ${bs.FAIL || 0} fail, ${bs.REWORK || 0} rework, ${bs.REVIEW || 0} review)`;
+    const scale = `scale ${(+src.mm_per_px).toFixed(3)} mm/px (${src.scale_source})`;
+    let detail;
+    if (src.ended) {
+      detail = src.results > 0
+        ? `Analysis complete — ${counts} · ${scale}`
+        : "Analysis complete — no complete billet found. Keep the whole billet inside the frame.";
+    } else if (src.kind === "configured") {
+      detail = `${counts} · ${scale}`;
+    } else {
+      detail = `Analysing… ${counts} · ${scale}`;
+    }
+    if (src.scale_source !== "marker" && (src.kind === "video" || src.kind === "image")) {
+      detail += " — no calibration marker found, so mm values use the stored scale";
+    }
+    _setText("src-detail", detail);
+
+    const finite = src.kind === "video" || src.kind === "image";
+    _srcProgress(finite && src.frames_total ? (src.ended ? 1 : src.frames_done / src.frames_total) : null);
+  }
+
+  let _bootId = null;      // server start id; a change means the server restarted under this page
+  let _serverDown = false;
+
+  async function _fetchSource() {
+    try {
+      const r = await fetch("/api/source");
+      if (!r.ok) return;
+      const src = await r.json();
+      const restarted = (_bootId !== null && src.boot_id !== _bootId) || _serverDown;
+      _bootId = src.boot_id;
+      _serverDown = false;
+      if (restarted) {          // recover without a manual F5
+        _reattachStream(); _fetchAlerts(); _fetchLog(); _fetchTolerances();
+      }
+      _renderSource(src);
+    } catch (_) {
+      _serverDown = true;       // server restarting — reconnect as soon as it answers again
+    }
+  }
+
+  async function _srcCall(url, label) {
+    _srcBusy(true);
+    _srcMessage(label, true);
+    try {
+      const res = await fetch(url, { method: "POST" });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      _srcMessage("", true);
+      _onSourceChanged();
+    } catch (err) {
+      _srcMessage(String(err.message || err), false);
+    } finally {
+      _srcBusy(false);
+    }
+  }
+
+  /** Upload ``file`` as the raw request body (with progress); resolves to the parsed JSON reply. */
+  function _uploadFile(kind, file) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `/api/source/${kind}?filename=${encodeURIComponent(file.name)}`);
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          _srcProgress(e.loaded / e.total);
+          _srcMessage(`Uploading ${file.name}… ${Math.round(e.loaded / e.total * 100)}%`, true);
+        }
+      };
+      xhr.upload.onload = () => _srcMessage(`Preparing ${file.name}…`, true);
+      xhr.onerror = () => reject(new Error("Upload failed — is the server running?"));
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+        else reject(new Error(body.detail || `HTTP ${xhr.status}`));
+      };
+      xhr.send(file);
+    });
+  }
+
+  async function _onFilePicked(kind, input) {
+    const file = input.files && input.files[0];
+    input.value = "";                       // allow re-picking the same file
+    if (!file) return;
+    _srcBusy(true);
+    try {
+      await _uploadFile(kind, file);
+      _srcMessage("", true);
+      _onSourceChanged();
+    } catch (err) {
+      _srcMessage(String(err.message || err), false);
+      _srcProgress(null);
+    } finally {
+      _srcBusy(false);
+    }
+  }
+
+  function _initSource() {
+    const on = (id, ev, fn) => document.getElementById(id)?.addEventListener(ev, fn);
+    on("src-demo-btn", "click",
+      () => _srcCall("/api/source/demo", "Starting simulated conveyor (the first run renders the belt video, ~2 min)…"));
+    on("src-camera-btn", "click", () => _srcCall("/api/source/camera", "Opening the camera…"));
+    on("src-video-btn", "click", () => document.getElementById("src-video-input")?.click());
+    on("src-image-btn", "click", () => document.getElementById("src-image-input")?.click());
+    on("src-video-input", "change", e => _onFilePicked("video", e.target));
+    on("src-image-input", "change", e => _onFilePicked("image", e.target));
+    _fetchSource();
+    setInterval(_fetchSource, 1500);
   }
 
   /* ── Tab switching ───────────────────────────────────────────────────── */
@@ -604,7 +943,7 @@
         // Lazy-load tab data on first switch
         if (btn.dataset.tab === "log")        _fetchLog();
         if (btn.dataset.tab === "review")     _fetchReviewQueue();
-        if (btn.dataset.tab === "tolerances") _fetchTolerances();
+        if (btn.dataset.tab === "tolerances") { _fetchTolerances(); _fetchCalibration(); }
       });
     });
   }
@@ -655,11 +994,15 @@
 
   /* ── Init ────────────────────────────────────────────────────────────── */
   function init() {
+    _initTheme();
+    _initStreamPill();
     _initTabs();
+    _initSource();
 
     // Tolerances tab buttons
     document.getElementById("save-tol-btn")?.addEventListener("click", _saveTolerances);
     document.getElementById("activate-profile-btn")?.addEventListener("click", _activateProfile);
+    document.getElementById("recalibrate-btn")?.addEventListener("click", _recalibrate);
     document.getElementById("profile-select")?.addEventListener("change", e => {
       _loadProfileFields(e.target.value);
     });
@@ -669,7 +1012,12 @@
     document.getElementById("clear-alerts-btn")?.addEventListener("click", _clearActiveAlert);
 
     // Log filters
-    document.getElementById("log-filter-id")?.addEventListener("input", _renderLogTable);
+    let _idDebounce = null;
+    document.getElementById("log-filter-id")?.addEventListener("input", () => {
+      _renderLogTable();                       // instant client-side filter on loaded rows
+      clearTimeout(_idDebounce);               // then look up older matches on the server
+      _idDebounce = setTimeout(_fetchLog, 350);
+    });
     document.getElementById("log-filter-status")?.addEventListener("change", () => {
       _allRows = []; // clear so fresh fetch respects status filter
       _fetchLog();

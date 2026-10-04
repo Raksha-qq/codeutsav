@@ -49,9 +49,25 @@ def denoise(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
     return cv2.GaussianBlur(gray, (ksize, ksize), 0)
 
 
+def auto_gamma(
+    gray: np.ndarray, target_mean: float = 110.0, lo: float = 0.4, hi: float = 2.5
+) -> float:
+    """Pick a gamma that moves the mean grey level towards ``target_mean``.
+
+    Returns 1.0 (identity) for already well-exposed frames (mean within 35% of
+    the target) so normal footage is untouched.
+    """
+    mean = float(np.mean(gray))
+    if mean < 1.0 or mean > 254.0 or abs(mean - target_mean) / target_mean < 0.35:
+        return 1.0
+    gamma = float(np.log(mean / 255.0) / np.log(target_mean / 255.0))
+    return float(np.clip(gamma, lo, hi))
+
+
 def preprocess(
     frame: np.ndarray,
     *,
+    auto_exposure: bool = False,
     clip_limit: float = 2.0,
     tile_grid_size: tuple[int, int] = (8, 8),
     gamma: float = 1.0,
@@ -66,6 +82,8 @@ def preprocess(
         tile_grid_size: CLAHE tile grid size.
         gamma: Gamma correction exponent (1.0 = identity).
         denoise_ksize: Gaussian blur kernel size (odd integer ≥ 1).
+        auto_exposure: If True, derive ``gamma`` from the frame's mean
+            brightness (exposure normalisation for varied lighting).
         hot_billet_mode: If True, skip CLAHE (image is already high-contrast from
             brightness thresholding) and apply a larger denoise kernel.
 
@@ -73,6 +91,8 @@ def preprocess(
         Preprocessed single-channel uint8 image.
     """
     gray = to_gray(frame)
+    if auto_exposure and not hot_billet_mode:
+        gamma = auto_gamma(gray)
     if hot_billet_mode:
         gray = denoise(gray, ksize=max(denoise_ksize, 5))
     else:

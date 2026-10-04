@@ -111,6 +111,18 @@ class XlsxLogWriter:
             self.last_status = f"ERROR:{exc}"
             _safe_remove(tmp_path)
 
+    def update_record(self, billet_seq: int, fields: Dict[str, Any]) -> bool:
+        """Patch the buffered row with ``billet_seq`` (call ``flush`` to persist).
+
+        Returns True if the row is part of this (current-day) workbook.
+        """
+        for row in reversed(self._records):
+            if str(row.get("billet_seq")) == str(billet_seq):
+                row.update(fields)
+                self._unflushed += 1
+                return True
+        return False
+
     @property
     def pending_count(self) -> int:
         """Number of records buffered since the last flush."""
